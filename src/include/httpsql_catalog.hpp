@@ -39,8 +39,11 @@ public:
 	string GetDBPath() override { return server_url_; }
 
 private:
+	void EnsureSchemasLoaded();
+
 	string server_url_;
 	unordered_map<string, unique_ptr<HttpSQLSchemaEntry>> schema_entries_;
+	bool schemas_loaded_ = false;
 	mutex schema_lock_;
 };
 

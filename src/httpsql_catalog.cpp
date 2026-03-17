@@ -24,74 +24,65 @@ static vector<string> ParseStringArray(const string &json) {
 		size_t idx, max;
 		yyjson_val *val;
 		yyjson_arr_foreach(root, idx, max, val) {
-			if (yyjson_is_str(val)) {
-				result.emplace_back(yyjson_get_str(val));
-			}
+			if (yyjson_is_str(val)) result.emplace_back(yyjson_get_str(val));
 		}
 	}
 	yyjson_doc_free(doc);
 	return result;
 }
 
-void HttpSQLCatalog::ScanSchemas(ClientContext &context, std::function<void(SchemaCatalogEntry &)> callback) {
+// Fetches /api/schemas once and populates schema_entries_. Must be called under schema_lock_.
+void HttpSQLCatalog::EnsureSchemasLoaded() {
+	if (schemas_loaded_) return;
+
 	auto resp = http.Get("/api/schemas");
 	if (!resp.ok()) {
-		throw IOException("httpsql: GET /api/schemas failed: %s", resp.error);
+		throw IOException("httpsql: GET /api/schemas failed (status %d): %s",
+		                  resp.status_code, resp.error);
 	}
-	auto names = ParseStringArray(resp.body);
-
-	lock_guard<mutex> l(schema_lock_);
-	for (auto &name : names) {
+	for (auto &name : ParseStringArray(resp.body)) {
 		if (schema_entries_.find(name) == schema_entries_.end()) {
 			CreateSchemaInfo info;
 			info.schema = name;
 			schema_entries_[name] = make_uniq<HttpSQLSchemaEntry>(*this, info);
 		}
-		callback(*schema_entries_[name]);
+	}
+	schemas_loaded_ = true;
+}
+
+void HttpSQLCatalog::ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) {
+	lock_guard<mutex> l(schema_lock_);
+	EnsureSchemasLoaded();
+	for (auto &[name, entry] : schema_entries_) {
+		callback(*entry);
 	}
 }
 
-optional_ptr<SchemaCatalogEntry> HttpSQLCatalog::LookupSchema(CatalogTransaction transaction,
+optional_ptr<SchemaCatalogEntry> HttpSQLCatalog::LookupSchema(CatalogTransaction,
                                                                   const EntryLookupInfo &schema_lookup,
                                                                   OnEntryNotFound if_not_found) {
-	auto resp = http.Get("/api/schemas");
-	if (!resp.ok()) {
-		if (if_not_found != OnEntryNotFound::RETURN_NULL) {
-			throw IOException("httpsql: GET /api/schemas failed: %s", resp.error);
-		}
-		return nullptr;
-	}
-	auto all_schemas = ParseStringArray(resp.body);
-	auto schema_name = schema_lookup.GetEntryName();
+	lock_guard<mutex> l(schema_lock_);
+	EnsureSchemasLoaded();
 
+	auto schema_name = schema_lookup.GetEntryName();
 	if (schema_name == DEFAULT_SCHEMA) {
-		if (all_schemas.empty()) {
+		if (schema_entries_.empty()) {
 			if (if_not_found != OnEntryNotFound::RETURN_NULL) {
 				throw BinderException("No schemas available in httpsql catalog");
 			}
 			return nullptr;
 		}
-		schema_name = all_schemas[0];
+		schema_name = schema_entries_.begin()->first;
 	}
 
-	bool found = false;
-	for (auto &s : all_schemas) {
-		if (s == schema_name) { found = true; break; }
-	}
-	if (!found) {
+	auto it = schema_entries_.find(schema_name);
+	if (it == schema_entries_.end()) {
 		if (if_not_found != OnEntryNotFound::RETURN_NULL) {
 			throw BinderException("Schema \"%s\" not found in httpsql catalog", schema_name);
 		}
 		return nullptr;
 	}
-
-	lock_guard<mutex> l(schema_lock_);
-	if (schema_entries_.find(schema_name) == schema_entries_.end()) {
-		CreateSchemaInfo info;
-		info.schema = schema_name;
-		schema_entries_[schema_name] = make_uniq<HttpSQLSchemaEntry>(*this, info);
-	}
-	return schema_entries_[schema_name].get();
+	return it->second.get();
 }
 
 optional_ptr<CatalogEntry> HttpSQLCatalog::CreateSchema(CatalogTransaction, CreateSchemaInfo &) {
@@ -100,8 +91,8 @@ optional_ptr<CatalogEntry> HttpSQLCatalog::CreateSchema(CatalogTransaction, Crea
 void HttpSQLCatalog::DropSchema(ClientContext &, DropInfo &) {
 	throw BinderException("httpsql catalog is read-only");
 }
-PhysicalOperator &HttpSQLCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &, LogicalCreateTable &,
-                                                       PhysicalOperator &) {
+PhysicalOperator &HttpSQLCatalog::PlanCreateTableAs(ClientContext &, PhysicalPlanGenerator &,
+                                                       LogicalCreateTable &, PhysicalOperator &) {
 	throw NotImplementedException("httpsql catalog is read-only");
 }
 PhysicalOperator &HttpSQLCatalog::PlanInsert(ClientContext &, PhysicalPlanGenerator &, LogicalInsert &,
@@ -116,7 +107,8 @@ PhysicalOperator &HttpSQLCatalog::PlanUpdate(ClientContext &, PhysicalPlanGenera
                                                 PhysicalOperator &) {
 	throw NotImplementedException("httpsql catalog is read-only");
 }
-unique_ptr<LogicalOperator> HttpSQLCatalog::BindCreateIndex(Binder &, CreateStatement &, TableCatalogEntry &,
+unique_ptr<LogicalOperator> HttpSQLCatalog::BindCreateIndex(Binder &, CreateStatement &,
+                                                               TableCatalogEntry &,
                                                                unique_ptr<LogicalOperator>) {
 	throw NotImplementedException("httpsql catalog is read-only");
 }

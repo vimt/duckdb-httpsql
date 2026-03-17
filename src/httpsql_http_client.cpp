@@ -2,35 +2,26 @@
 
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include <cctype>
 #include <cstring>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 
 namespace duckdb {
 
-static void ParseURL(const std::string &url, std::string &host, int &port, std::string &path) {
+// ─── URL parsing ──────────────────────────────────────────────────────────────
+
+static void ParseURL(const std::string &url, std::string &host, int &port) {
 	std::string u = url;
-	if (u.substr(0, 7) == "http://") {
-		u = u.substr(7);
-	}
-	// strip query string from url for base
+	if (u.substr(0, 7) == "http://") u = u.substr(7);
 	auto qpos = u.find('?');
-	if (qpos != std::string::npos) {
-		u = u.substr(0, qpos);
-	}
+	if (qpos != std::string::npos) u = u.substr(0, qpos);
 	auto slash = u.find('/');
-	std::string hostport;
-	if (slash != std::string::npos) {
-		hostport = u.substr(0, slash);
-		path = u.substr(slash);
-	} else {
-		hostport = u;
-		path = "/";
-	}
+	std::string hostport = (slash != std::string::npos) ? u.substr(0, slash) : u;
 	auto colon = hostport.find(':');
 	if (colon != std::string::npos) {
 		host = hostport.substr(0, colon);
@@ -41,8 +32,226 @@ static void ParseURL(const std::string &url, std::string &host, int &port, std::
 	}
 }
 
+// ─── Buffered reader (avoids one-syscall-per-byte) ───────────────────────────
+
+struct ConnReader {
+	int fd;
+	char buf[8192];
+	size_t start = 0, end = 0;
+	bool eof = false;
+
+	bool Fill() {
+		ssize_t n = recv(fd, buf, sizeof(buf), 0);
+		if (n <= 0) { eof = true; return false; }
+		start = 0;
+		end = (size_t)n;
+		return true;
+	}
+
+	bool ReadByte(char &c) {
+		if (start >= end && !Fill()) return false;
+		c = buf[start++];
+		return true;
+	}
+
+	// Read until \r\n (consumes \r\n, returns line without it)
+	bool ReadLine(std::string &line) {
+		line.clear();
+		char c;
+		while (ReadByte(c)) {
+			if (c == '\r') { ReadByte(c); return true; } // consume \n
+			line += c;
+		}
+		return false;
+	}
+
+	// Read exactly n bytes into out
+	bool ReadExact(std::string &out, size_t n) {
+		out.reserve(out.size() + n);
+		while (n > 0) {
+			if (start >= end && !Fill()) return false;
+			size_t avail = std::min(n, end - start);
+			out.append(buf + start, avail);
+			start += avail;
+			n -= avail;
+		}
+		return true;
+	}
+};
+
+// ─── Constructor / Destructor ─────────────────────────────────────────────────
+
 HttpSQLHttpClient::HttpSQLHttpClient(const std::string &base_url) {
-	ParseURL(base_url, host_, port_, base_path_);
+	ParseURL(base_url, host_, port_);
+
+	struct addrinfo hints {}, *res = nullptr;
+	hints.ai_family   = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	if (getaddrinfo(host_.c_str(), std::to_string(port_).c_str(), &hints, &res) == 0 && res) {
+		memcpy(&server_addr_, res->ai_addr, res->ai_addrlen);
+		server_addr_len_ = (socklen_t)res->ai_addrlen;
+		addr_family_     = res->ai_family;
+		sock_proto_      = res->ai_protocol;
+		addr_resolved_   = true;
+		freeaddrinfo(res);
+	}
+}
+
+HttpSQLHttpClient::~HttpSQLHttpClient() {
+	std::lock_guard<std::mutex> l(pool_mutex_);
+	for (int fd : idle_conns_) close(fd);
+	idle_conns_.clear();
+}
+
+// ─── Connection pool ──────────────────────────────────────────────────────────
+
+int HttpSQLHttpClient::NewConn() {
+	if (!addr_resolved_) return -1;
+	int fd = socket(addr_family_, SOCK_STREAM, sock_proto_);
+	if (fd < 0) return -1;
+	int one = 1;
+	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	if (connect(fd, (struct sockaddr *)&server_addr_, server_addr_len_) < 0) {
+		close(fd);
+		return -1;
+	}
+	return fd;
+}
+
+int HttpSQLHttpClient::AcquireConn() {
+	{
+		std::lock_guard<std::mutex> l(pool_mutex_);
+		if (!idle_conns_.empty()) {
+			int fd = idle_conns_.back();
+			idle_conns_.pop_back();
+			return fd;
+		}
+	}
+	return NewConn();
+}
+
+void HttpSQLHttpClient::ReleaseConn(int fd) {
+	std::lock_guard<std::mutex> l(pool_mutex_);
+	if ((int)idle_conns_.size() < kMaxIdleConns) {
+		idle_conns_.push_back(fd);
+	} else {
+		close(fd);
+	}
+}
+
+void HttpSQLHttpClient::CloseConn(int fd) {
+	if (fd >= 0) close(fd);
+}
+
+// ─── Request / Response ───────────────────────────────────────────────────────
+
+HttpResponse HttpSQLHttpClient::DoRequestOnFd(int fd, const std::string &method,
+                                               const std::string &path,
+                                               const std::string &body) {
+	HttpResponse resp;
+
+	// Build and send request
+	std::string req;
+	req.reserve(256 + body.size());
+	req += method; req += ' '; req += path; req += " HTTP/1.1\r\n";
+	req += "Host: "; req += host_; req += ':'; req += std::to_string(port_); req += "\r\n";
+	req += "Connection: keep-alive\r\n";
+	if (!body.empty()) {
+		req += "Content-Type: application/json\r\n";
+		req += "Content-Length: "; req += std::to_string(body.size()); req += "\r\n";
+	}
+	req += "\r\n";
+	req += body;
+
+	// Send all bytes
+	size_t sent = 0;
+	while (sent < req.size()) {
+		ssize_t n = send(fd, req.c_str() + sent, req.size() - sent, MSG_NOSIGNAL);
+		if (n <= 0) { resp.error = "send() failed"; return resp; }
+		sent += n;
+	}
+
+	// Read response headers
+	ConnReader reader;
+	reader.fd = fd;
+	std::string status_line;
+	if (!reader.ReadLine(status_line)) { resp.error = "recv() failed on status line"; return resp; }
+
+	// Parse status code: "HTTP/1.1 200 OK"
+	auto sp1 = status_line.find(' ');
+	if (sp1 != std::string::npos) {
+		resp.status_code = std::stoi(status_line.substr(sp1 + 1));
+	}
+
+	bool is_chunked = false;
+	int64_t content_length = -1;
+
+	std::string header_line;
+	while (reader.ReadLine(header_line) && !header_line.empty()) {
+		auto colon = header_line.find(':');
+		if (colon == std::string::npos) continue;
+		std::string key   = header_line.substr(0, colon);
+		std::string value = header_line.substr(colon + 1);
+		// trim whitespace
+		while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) value.erase(0, 1);
+		// lowercase key for comparison
+		for (auto &c : key) c = (char)tolower((unsigned char)c);
+		if (key == "transfer-encoding") {
+			for (auto &c : value) c = (char)tolower((unsigned char)c);
+			is_chunked = value.find("chunked") != std::string::npos;
+		} else if (key == "content-length") {
+			content_length = std::stoll(value);
+		}
+	}
+
+	// Read body
+	if (is_chunked) {
+		std::string chunk_size_line;
+		while (reader.ReadLine(chunk_size_line)) {
+			auto semi = chunk_size_line.find(';');
+			if (semi != std::string::npos) chunk_size_line = chunk_size_line.substr(0, semi);
+			if (chunk_size_line.empty()) continue;
+			size_t chunk_size = std::stoul(chunk_size_line, nullptr, 16);
+			if (chunk_size == 0) {
+				reader.ReadLine(chunk_size_line); // consume trailing \r\n
+				break;
+			}
+			if (!reader.ReadExact(resp.body, chunk_size)) break;
+			reader.ReadLine(chunk_size_line); // consume \r\n after chunk data
+		}
+	} else if (content_length >= 0) {
+		reader.ReadExact(resp.body, (size_t)content_length);
+	} else {
+		// Fallback: read until connection close
+		std::string tmp;
+		while (reader.ReadExact(tmp, sizeof(reader.buf))) {}
+		resp.body += tmp;
+	}
+
+	return resp;
+}
+
+HttpResponse HttpSQLHttpClient::DoRequest(const std::string &method, const std::string &path,
+                                           const std::string &body) {
+	// Try up to 2 attempts: first on a pooled/existing conn, then on a fresh one
+	for (int attempt = 0; attempt < 2; attempt++) {
+		int fd = (attempt == 0) ? AcquireConn() : NewConn();
+		if (fd < 0) {
+			HttpResponse r;
+			r.error = "failed to connect to " + host_ + ":" + std::to_string(port_);
+			return r;
+		}
+		auto resp = DoRequestOnFd(fd, method, path, body);
+		if (resp.status_code > 0) {
+			ReleaseConn(fd);
+			return resp;
+		}
+		// Connection was stale or broken — discard and retry with a fresh one
+		CloseConn(fd);
+	}
+	HttpResponse r;
+	r.error = "connection failed after retry";
+	return r;
 }
 
 HttpResponse HttpSQLHttpClient::Get(const std::string &path) {
@@ -51,112 +260,6 @@ HttpResponse HttpSQLHttpClient::Get(const std::string &path) {
 
 HttpResponse HttpSQLHttpClient::Post(const std::string &path, const std::string &body) {
 	return DoRequest("POST", path, body);
-}
-
-HttpResponse HttpSQLHttpClient::DoRequest(const std::string &method, const std::string &path,
-                                             const std::string &body) {
-	HttpResponse resp;
-
-	struct addrinfo hints {}, *res = nullptr;
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	std::string port_str = std::to_string(port_);
-	if (getaddrinfo(host_.c_str(), port_str.c_str(), &hints, &res) != 0) {
-		resp.error = "DNS lookup failed for " + host_;
-		return resp;
-	}
-
-	int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-	if (sock < 0) {
-		freeaddrinfo(res);
-		resp.error = "socket() failed";
-		return resp;
-	}
-
-	if (connect(sock, res->ai_addr, res->ai_addrlen) < 0) {
-		close(sock);
-		freeaddrinfo(res);
-		resp.error = "connect() failed to " + host_ + ":" + port_str;
-		return resp;
-	}
-	freeaddrinfo(res);
-
-	std::ostringstream req;
-	req << method << " " << path << " HTTP/1.1\r\n";
-	req << "Host: " << host_ << ":" << port_ << "\r\n";
-	req << "Connection: close\r\n";
-	if (!body.empty()) {
-		req << "Content-Type: application/json\r\n";
-		req << "Content-Length: " << body.size() << "\r\n";
-	}
-	req << "\r\n";
-	if (!body.empty()) {
-		req << body;
-	}
-	std::string req_str = req.str();
-	send(sock, req_str.c_str(), req_str.size(), 0);
-
-	// Read response
-	std::string raw;
-	char buf[4096];
-	ssize_t n;
-	while ((n = recv(sock, buf, sizeof(buf), 0)) > 0) {
-		raw.append(buf, n);
-	}
-	close(sock);
-
-	// Parse HTTP response
-	auto header_end = raw.find("\r\n\r\n");
-	if (header_end == std::string::npos) {
-		resp.error = "malformed HTTP response";
-		return resp;
-	}
-	std::string headers = raw.substr(0, header_end);
-	std::string raw_body = raw.substr(header_end + 4);
-
-	// Parse status code from first line
-	auto sp1 = headers.find(' ');
-	if (sp1 != std::string::npos) {
-		auto sp2 = headers.find(' ', sp1 + 1);
-		resp.status_code = std::stoi(headers.substr(sp1 + 1, sp2 - sp1 - 1));
-	}
-
-	// Check for chunked transfer encoding
-	bool is_chunked = false;
-	{
-		auto lower_headers = headers;
-		for (auto &c : lower_headers) c = (char)tolower((unsigned char)c);
-		is_chunked = lower_headers.find("transfer-encoding: chunked") != std::string::npos;
-	}
-
-	if (is_chunked) {
-		// Decode chunked body
-		std::string decoded;
-		size_t pos = 0;
-		while (pos < raw_body.size()) {
-			auto nl = raw_body.find("\r\n", pos);
-			if (nl == std::string::npos) break;
-			std::string size_str = raw_body.substr(pos, nl - pos);
-			// Remove chunk extensions
-			auto semi = size_str.find(';');
-			if (semi != std::string::npos) size_str = size_str.substr(0, semi);
-			if (size_str.empty()) break;
-			size_t chunk_size = std::stoul(size_str, nullptr, 16);
-			if (chunk_size == 0) break;
-			pos = nl + 2;
-			if (pos + chunk_size > raw_body.size()) {
-				decoded.append(raw_body, pos, raw_body.size() - pos);
-				break;
-			}
-			decoded.append(raw_body, pos, chunk_size);
-			pos += chunk_size + 2; // skip data + \r\n
-		}
-		resp.body = std::move(decoded);
-	} else {
-		resp.body = std::move(raw_body);
-	}
-
-	return resp;
 }
 
 } // namespace duckdb
