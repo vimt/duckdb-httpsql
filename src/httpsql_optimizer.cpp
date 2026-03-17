@@ -1,6 +1,8 @@
 #include "httpsql_optimizer.hpp"
 #include "httpsql_scanner.hpp"
 
+#include "duckdb/common/arrow/arrow_converter.hpp"
+#include "duckdb/function/table/arrow.hpp"
 #include "duckdb/catalog/catalog.hpp"
 #include "duckdb/catalog/catalog_entry/aggregate_function_catalog_entry.hpp"
 #include "duckdb/function/function_binder.hpp"
@@ -247,8 +249,21 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 		auto &info = agg_infos[i];
 		LogicalType vtype;
 		switch (info.kind) {
-		case AggKind::MIN: case AggKind::MAX: case AggKind::SUM:
+		case AggKind::MIN: case AggKind::MAX:
 			vtype = info.orig_type; break;
+		case AggKind::SUM:
+			// SUM of DECIMAL columns returns a wider DECIMAL in DuckDB
+			// (e.g. DECIMAL(38,0) for DECIMAL(10,0)), and the MySQL result has
+			// different precision than DuckDB's expected virtual type.
+			// Skip pushdown for DECIMAL to avoid type-binding errors; DuckDB
+			// will compute the sum locally on the raw scanned values.
+			if (info.orig_type.id() == LogicalTypeId::DECIMAL) {
+				return remap; // Don't push down SUM(DECIMAL) — type-binding is complex
+			}
+			// MySQL DECIMAL for SUM(int): Go server maps scale-0 DECIMAL to Int64.
+			// Use BIGINT so ArrowToDuckDB decodes correctly.
+			vtype = (info.orig_type == LogicalType::HUGEINT) ? LogicalType::BIGINT : info.orig_type;
+			break;
 		case AggKind::COUNT_STAR: case AggKind::COUNT_COL:
 			vtype = LogicalType::BIGINT; has_count_rewrite = true; break;
 		}
@@ -264,6 +279,21 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 	get.names = virtual_names;
 	get.projection_ids.clear();
 	bind_data.agg_pushdown = std::move(pushdown);
+
+	// ── Sync ArrowScanFunctionData schema to virtual columns ────────────────
+	// ArrowScanInitGlobal / ArrowToDuckDB uses schema_root + arrow_table to
+	// map column_ids → Arrow types. After agg_pushdown they hold virtual cols
+	// (0..total_cols-1), so we must update all three schema structures.
+	bind_data.all_types = virtual_types;
+	// Release the old Arrow schema before overwriting.
+	if (bind_data.schema_root.arrow_schema.release) {
+		bind_data.schema_root.arrow_schema.release(&bind_data.schema_root.arrow_schema);
+	}
+	auto options = input.context.GetClientProperties();
+	ArrowConverter::ToArrowSchema(&bind_data.schema_root.arrow_schema, virtual_types, virtual_names, options);
+	bind_data.arrow_table = ArrowTableSchema();
+	ArrowTableFunction::PopulateArrowTableSchema(input.context, bind_data.arrow_table,
+	                                              bind_data.schema_root.arrow_schema);
 
 	for (idx_t i = 0; i < num_groups; i++) {
 		agg.groups[i] = make_uniq<BoundColumnRefExpression>(

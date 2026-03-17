@@ -2,7 +2,9 @@
 #include "httpsql_catalog.hpp"
 #include "httpsql_table_entry.hpp"
 #include "httpsql_http_client.hpp"
-#include "httpsql_arrow_reader.hpp"
+#include "httpsql_ipc_stream.hpp"
+
+#include "duckdb/function/table/arrow.hpp"
 
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
@@ -12,12 +14,20 @@
 
 namespace duckdb {
 
-HttpSQLBindData::HttpSQLBindData(HttpSQLTableEntry &table) : table(table) {}
+// ─── HttpSQLBindData ─────────────────────────────────────────────────────────
 
-// ─── Filter → SQL WHERE clause ─────────────────────────────────────────────
+// stream_factory_ptr points to `this`; the object must be heap-allocated and
+// not moved after construction.
+HttpSQLBindData::HttpSQLBindData(HttpSQLTableEntry &table_p)
+    : ArrowScanFunctionData(HttpSQLProduce, reinterpret_cast<uintptr_t>(this)), table(table_p) {
+}
+
+// ─── Filter → SQL WHERE clause ───────────────────────────────────────────────
 
 static string TransformConstant(const Value &val) {
-	if (val.IsNull()) return "NULL";
+	if (val.IsNull()) {
+		return "NULL";
+	}
 	switch (val.type().id()) {
 	case LogicalTypeId::BOOLEAN:
 		return val.GetValue<bool>() ? "1" : "0";
@@ -39,13 +49,20 @@ static string TransformConstant(const Value &val) {
 
 static string TransformComparison(ExpressionType type) {
 	switch (type) {
-	case ExpressionType::COMPARE_EQUAL: return "=";
-	case ExpressionType::COMPARE_NOTEQUAL: return "!=";
-	case ExpressionType::COMPARE_LESSTHAN: return "<";
-	case ExpressionType::COMPARE_GREATERTHAN: return ">";
-	case ExpressionType::COMPARE_LESSTHANOREQUALTO: return "<=";
-	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return ">=";
-	default: throw NotImplementedException("Unsupported comparison type");
+	case ExpressionType::COMPARE_EQUAL:
+		return "=";
+	case ExpressionType::COMPARE_NOTEQUAL:
+		return "!=";
+	case ExpressionType::COMPARE_LESSTHAN:
+		return "<";
+	case ExpressionType::COMPARE_GREATERTHAN:
+		return ">";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:
+		return "<=";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO:
+		return ">=";
+	default:
+		throw NotImplementedException("Unsupported comparison type");
 	}
 }
 
@@ -56,9 +73,13 @@ static string CreateExpression(const string &col, const vector<unique_ptr<TableF
 	vector<string> parts;
 	for (auto &f : filters) {
 		auto s = TransformFilter(col, *f);
-		if (!s.empty()) parts.push_back(s);
+		if (!s.empty()) {
+			parts.push_back(s);
+		}
 	}
-	if (parts.empty()) return "";
+	if (parts.empty()) {
+		return "";
+	}
 	return "(" + StringUtil::Join(parts, " " + op + " ") + ")";
 }
 
@@ -85,14 +106,18 @@ static string TransformFilter(const string &col, const TableFilter &filter) {
 		auto &inf = filter.Cast<InFilter>();
 		string in_list;
 		for (auto &v : inf.values) {
-			if (!in_list.empty()) in_list += ",";
+			if (!in_list.empty()) {
+				in_list += ",";
+			}
 			in_list += TransformConstant(v);
 		}
 		return col + " IN (" + in_list + ")";
 	}
 	case TableFilterType::OPTIONAL_FILTER: {
 		auto &of = filter.Cast<OptionalFilter>();
-		if (of.child_filter) return TransformFilter(col, *of.child_filter);
+		if (of.child_filter) {
+			return TransformFilter(col, *of.child_filter);
+		}
 		return "";
 	}
 	default:
@@ -100,81 +125,63 @@ static string TransformFilter(const string &col, const TableFilter &filter) {
 	}
 }
 
-static string BuildWhereClause(const vector<column_t> &column_ids,
-                                optional_ptr<TableFilterSet> filters,
-                                const vector<string> &names) {
-	if (!filters || filters->filters.empty()) return "";
+// Build WHERE clause from ArrowStreamParameters::filters.
+// filter_to_col maps filter column index → physical schema column index.
+static string BuildWhereClause(const ArrowStreamParameters &parameters, const vector<string> &all_names) {
+	if (!parameters.filters || parameters.filters->filters.empty()) {
+		return "";
+	}
 	vector<string> parts;
-	for (auto &[col_idx, filter] : filters->filters) {
-		if (col_idx >= column_ids.size()) continue;
-		auto phys_col = column_ids[col_idx];
-		if (phys_col == COLUMN_IDENTIFIER_ROW_ID || phys_col >= names.size()) continue;
-		string col_name = "`" + names[phys_col] + "`";
+	for (auto &[filter_col_idx, filter] : parameters.filters->filters) {
+		// Map filter column index → physical column index.
+		auto it = parameters.projected_columns.filter_to_col.find(filter_col_idx);
+		if (it == parameters.projected_columns.filter_to_col.end()) {
+			continue;
+		}
+		idx_t phys_col = it->second;
+		if (phys_col == COLUMN_IDENTIFIER_ROW_ID || phys_col >= all_names.size()) {
+			continue;
+		}
+		string col_name = "`" + all_names[phys_col] + "`";
 		auto s = TransformFilter(col_name, *filter);
-		if (!s.empty()) parts.push_back(s);
+		if (!s.empty()) {
+			parts.push_back(s);
+		}
 	}
 	return parts.empty() ? "" : StringUtil::Join(parts, " AND ");
 }
 
-// ─── Global state: holds the Arrow IPC response body and parse position ───────
+// ─── Produce (called by ArrowScanInitGlobal via ProduceArrowScan) ─────────────
 
-struct HttpSQLGlobalState : public GlobalTableFunctionState {
-	string body;                      // complete Arrow IPC response body
-	vector<ArrowColInfo> col_info;    // parsed from Schema message
-	bool schema_parsed = false;
-	bool done = false;
-
-	// Reader is constructed lazily on first scan call (needs schema parsed first).
-	unique_ptr<ArrowIPCReader> reader;
-
-	idx_t MaxThreads() const override {
-		return 1;
-	}
-};
-
-struct HttpSQLLocalState : public LocalTableFunctionState {};
-
-// ─── Build and send the HTTP query, populate global state ──────────────────
-
-static unique_ptr<FunctionData> HttpSQLBind(ClientContext &, TableFunctionBindInput &,
-                                               vector<LogicalType> &, vector<string> &) {
-	throw InternalException("HttpSQLBind should not be called directly");
-}
-
-static unique_ptr<GlobalTableFunctionState> HttpSQLInitGlobalState(ClientContext &context,
-                                                                      TableFunctionInitInput &input) {
-	auto &bind_data = input.bind_data->Cast<HttpSQLBindData>();
-	auto &table = bind_data.table;
+unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowStreamParameters &parameters) {
+	auto &bind = *reinterpret_cast<HttpSQLBindData *>(factory_ptr);
+	auto &table = bind.table;
 	auto &cat = table.catalog.Cast<HttpSQLCatalog>();
 
-	auto gstate = make_uniq<HttpSQLGlobalState>();
+	bool agg_mode = bind.agg_pushdown != nullptr;
 
-	bool agg_mode = bind_data.agg_pushdown != nullptr;
-
-	// Build column list (projection)
+	// ── Build columns list ──────────────────────────────────────────────────
 	vector<string> col_names;
 	if (!agg_mode) {
-		for (auto col_id : input.column_ids) {
-			if (col_id == COLUMN_IDENTIFIER_ROW_ID) {
-				// skip, we'll use NULL below
-			} else {
-				col_names.push_back(table.GetColumn(LogicalIndex(col_id)).GetName());
-			}
+		// Use column names from projection pushdown.
+		for (auto &name : parameters.projected_columns.columns) {
+			col_names.push_back(name);
 		}
 	}
 
-	// Build WHERE clause from filters
-	string where_clause = BuildWhereClause(input.column_ids, input.filters, bind_data.names);
+	// ── Build WHERE clause ──────────────────────────────────────────────────
+	string where_clause = BuildWhereClause(parameters, bind.all_names);
 
-	// Build JSON request
+	// ── Assemble JSON request body ─────────────────────────────────────────
 	string body = "{";
 	body += "\"schema\":\"" + table.schema.name + "\",";
 	body += "\"table\":\"" + table.name + "\",";
 
-	// columns array
 	body += "\"columns\":[";
 	for (idx_t i = 0; i < col_names.size(); i++) {
-		if (i > 0) body += ",";
+		if (i > 0) {
+			body += ",";
+		}
 		body += "\"" + col_names[i] + "\"";
 	}
 	body += "]";
@@ -182,24 +189,28 @@ static unique_ptr<GlobalTableFunctionState> HttpSQLInitGlobalState(ClientContext
 	if (!where_clause.empty()) {
 		body += ",\"where\":\"" + StringUtil::Replace(where_clause, "\"", "\\\"") + "\"";
 	}
-	if (!bind_data.limit_clause.empty()) {
-		body += ",\"limit\":\"" + bind_data.limit_clause + "\"";
+	if (!bind.limit_clause.empty()) {
+		body += ",\"limit\":\"" + bind.limit_clause + "\"";
 	}
-	if (!bind_data.order_clause.empty()) {
-		body += ",\"order\":\"" + bind_data.order_clause + "\"";
+	if (!bind.order_clause.empty()) {
+		body += ",\"order\":\"" + bind.order_clause + "\"";
 	}
 	if (agg_mode) {
-		auto &pd = *bind_data.agg_pushdown;
+		auto &pd = *bind.agg_pushdown;
 		string agg_select;
 		for (idx_t i = 0; i < pd.output_cols.size(); i++) {
-			if (i > 0) agg_select += ", ";
+			if (i > 0) {
+				agg_select += ", ";
+			}
 			agg_select += pd.output_cols[i].sql_expr;
 		}
 		body += ",\"agg_select\":\"" + StringUtil::Replace(agg_select, "\"", "\\\"") + "\"";
 		if (!pd.group_col_names.empty()) {
 			string group_by;
 			for (idx_t i = 0; i < pd.group_col_names.size(); i++) {
-				if (i > 0) group_by += ", ";
+				if (i > 0) {
+					group_by += ", ";
+				}
 				group_by += pd.group_col_names[i];
 			}
 			body += ",\"agg_group_by\":\"" + group_by + "\"";
@@ -207,47 +218,22 @@ static unique_ptr<GlobalTableFunctionState> HttpSQLInitGlobalState(ClientContext
 	}
 	body += "}";
 
-	Printer::Print(StringUtil::Format("[httpsql] POST /api/query: %s",
-	                                  body.substr(0, 200)));
+	Printer::Print(StringUtil::Format("[httpsql] POST /api/query: %s", body.substr(0, 300)));
 
 	auto resp = cat.http.Post("/api/query", body);
 	if (!resp.ok()) {
-		throw IOException("httpsql: POST /api/query failed (status %d): %s",
-		                  resp.status_code, resp.body.empty() ? resp.error : resp.body);
+		throw IOException("httpsql: POST /api/query failed (status %d): %s", resp.status_code,
+		                  resp.body.empty() ? resp.error : resp.body);
 	}
 
-	// Store the Arrow IPC body and parse the Schema message immediately.
-	gstate->body = std::move(resp.body);
-	gstate->reader = make_uniq<ArrowIPCReader>(gstate->body);
-	if (!gstate->reader->ReadSchema(gstate->col_info)) {
-		throw IOException("httpsql: failed to parse Arrow IPC Schema message");
-	}
-	gstate->schema_parsed = true;
-	return std::move(gstate);
+	return HttpSQLMakeIPCStream(std::move(resp.body));
 }
 
-static unique_ptr<LocalTableFunctionState> HttpSQLInitLocalState(ExecutionContext &, TableFunctionInitInput &,
-                                                                    GlobalTableFunctionState *) {
-	return make_uniq<HttpSQLLocalState>();
-}
+// ─── Scan function registration ───────────────────────────────────────────────
 
-// ─── Scan: parse next batch of NDJSON rows into DataChunk ─────────────────
-
-// ─── Scan: read one Arrow IPC RecordBatch per call ────────────────────────────
-
-static void HttpSQLScan(ClientContext &, TableFunctionInput &data, DataChunk &output) {
-	auto &gstate = data.global_state->Cast<HttpSQLGlobalState>();
-
-	if (gstate.done) {
-		output.SetCardinality(0);
-		return;
-	}
-
-	if (!gstate.reader->ReadRecordBatch(gstate.col_info, output)) {
-		gstate.done = true;
-		output.SetCardinality(0);
-		return;
-	}
+static unique_ptr<FunctionData> HttpSQLBind(ClientContext &, TableFunctionBindInput &, vector<LogicalType> &,
+                                             vector<string> &) {
+	throw InternalException("HttpSQLBind should not be called directly");
 }
 
 static InsertionOrderPreservingMap<string> HttpSQLToString(TableFunctionToStringInput &input) {
@@ -274,8 +260,8 @@ static BindInfo HttpSQLGetBindInfo(const optional_ptr<FunctionData> bind_data_p)
 }
 
 TableFunction CreateHttpSQLScanFunction() {
-	TableFunction func("httpsql_scan_internal", {}, HttpSQLScan, HttpSQLBind,
-	                   HttpSQLInitGlobalState, HttpSQLInitLocalState);
+	TableFunction func("httpsql_scan_internal", {}, ArrowTableFunction::ArrowScanFunction, HttpSQLBind,
+	                   ArrowTableFunction::ArrowScanInitGlobal, ArrowTableFunction::ArrowScanInitLocal);
 	func.to_string = HttpSQLToString;
 	func.serialize = HttpSQLSerialize;
 	func.deserialize = HttpSQLDeserialize;

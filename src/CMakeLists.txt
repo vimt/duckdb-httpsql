@@ -1,6 +1,4 @@
 include_directories(include)
-# yyjson from DuckDB third_party
-include_directories(${CMAKE_SOURCE_DIR}/third_party/yyjson/include)
 
 add_library(
   httpsql_library OBJECT
@@ -10,12 +8,17 @@ add_library(
   httpsql_schema_entry.cpp
   httpsql_table_entry.cpp
   httpsql_scanner.cpp
-  httpsql_arrow_reader.cpp
+  httpsql_ipc_stream.cpp
   httpsql_http_client.cpp
   httpsql_optimizer.cpp
   httpsql_transaction.cpp
   httpsql_transaction_manager.cpp
 )
+
+# Propagate nanoarrow include dirs to this OBJECT library.
+# FetchContent_MakeAvailable(nanoarrow) is called in the parent CMakeLists.txt.
+target_include_directories(httpsql_library PRIVATE
+    $<TARGET_PROPERTY:nanoarrow_ipc,INTERFACE_INCLUDE_DIRECTORIES>)
 
 set(ALL_OBJECT_FILES
     ${ALL_OBJECT_FILES} $<TARGET_OBJECTS:httpsql_library>
