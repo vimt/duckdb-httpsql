@@ -191,7 +191,7 @@ static unique_ptr<GlobalTableFunctionState> HttpSQLInitGlobalState(ClientContext
 		string agg_select;
 		for (idx_t i = 0; i < pd.output_cols.size(); i++) {
 			if (i > 0) agg_select += ", ";
-			agg_select += pd.output_cols[i].mysql_expr;
+			agg_select += pd.output_cols[i].sql_expr;
 		}
 		body += ",\"agg_select\":\"" + StringUtil::Replace(agg_select, "\"", "\\\"") + "\"";
 		if (!pd.group_col_names.empty()) {

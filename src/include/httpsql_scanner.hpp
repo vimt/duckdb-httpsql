@@ -6,7 +6,7 @@ namespace duckdb {
 class HttpSQLTableEntry;
 
 struct AggOutputCol {
-	string mysql_expr;
+	string sql_expr;
 };
 
 struct AggPushdown {

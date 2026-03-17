@@ -151,7 +151,7 @@ enum class AggKind { COUNT_STAR, COUNT_COL, SUM, MIN, MAX };
 
 struct AggInfo {
 	AggKind kind;
-	string mysql_expr;
+	string sql_expr;
 	LogicalType orig_type;
 };
 
@@ -162,7 +162,7 @@ static bool ClassifyAggregate(const BoundAggregateExpression &agg_expr, const Lo
 
 	if (fname == "count_star") {
 		out.kind = AggKind::COUNT_STAR;
-		out.mysql_expr = "COUNT(*)";
+		out.sql_expr = "COUNT(*)";
 		return true;
 	}
 	if (agg_expr.children.size() != 1) return false;
@@ -176,10 +176,10 @@ static bool ClassifyAggregate(const BoundAggregateExpression &agg_expr, const Lo
 	if (ci.IsRowIdColumn() || ci.GetPrimaryIndex() >= get.names.size()) return false;
 	string col_name = WriteIdentifier(get.names[ci.GetPrimaryIndex()]);
 
-	if (fname == "count") { out.kind = AggKind::COUNT_COL; out.mysql_expr = "COUNT(" + col_name + ")"; return true; }
-	if (fname == "sum")   { out.kind = AggKind::SUM;       out.mysql_expr = "SUM(" + col_name + ")"; return true; }
-	if (fname == "min")   { out.kind = AggKind::MIN;       out.mysql_expr = "MIN(" + col_name + ")"; return true; }
-	if (fname == "max")   { out.kind = AggKind::MAX;       out.mysql_expr = "MAX(" + col_name + ")"; return true; }
+	if (fname == "count") { out.kind = AggKind::COUNT_COL; out.sql_expr = "COUNT(" + col_name + ")"; return true; }
+	if (fname == "sum")   { out.kind = AggKind::SUM;       out.sql_expr = "SUM(" + col_name + ")"; return true; }
+	if (fname == "min")   { out.kind = AggKind::MIN;       out.sql_expr = "MIN(" + col_name + ")"; return true; }
+	if (fname == "max")   { out.kind = AggKind::MAX;       out.sql_expr = "MAX(" + col_name + ")"; return true; }
 	return false;
 }
 
@@ -205,7 +205,7 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 	auto &bind_data = get.bind_data->Cast<HttpSQLBindData>();
 	if (bind_data.agg_pushdown) return remap;
 
-	struct GroupInfo { string mysql_expr; LogicalType type; };
+	struct GroupInfo { string sql_expr; LogicalType type; };
 	vector<GroupInfo> group_infos;
 	auto &col_ids = get.GetColumnIds();
 	for (auto &grp_expr : agg.groups) {
@@ -238,8 +238,8 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 	for (idx_t i = 0; i < num_groups; i++) {
 		virtual_types.push_back(group_infos[i].type);
 		virtual_names.push_back("_g" + to_string(i));
-		pushdown->output_cols.push_back({group_infos[i].mysql_expr});
-		pushdown->group_col_names.push_back(group_infos[i].mysql_expr);
+		pushdown->output_cols.push_back({group_infos[i].sql_expr});
+		pushdown->group_col_names.push_back(group_infos[i].sql_expr);
 	}
 
 	bool has_count_rewrite = false;
@@ -254,7 +254,7 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 		}
 		virtual_types.push_back(vtype);
 		virtual_names.push_back("_a" + to_string(i));
-		pushdown->output_cols.push_back({info.mysql_expr});
+		pushdown->output_cols.push_back({info.sql_expr});
 	}
 
 	vector<ColumnIndex> new_col_ids;

@@ -15,7 +15,7 @@ using namespace duckdb_yyjson;
 
 namespace duckdb {
 
-static LogicalType MySQLTypeToDuckDB(const string &type_name, const string &column_type,
+static LogicalType TypeNameToDuckDB(const string &type_name, const string &column_type,
                                       int64_t precision, int64_t scale) {
 	auto lower = StringUtil::Lower(type_name);
 	bool is_unsigned = column_type.find("unsigned") != string::npos;
@@ -114,7 +114,7 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 
 		auto create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)*this, tbl.name);
 		for (auto &col : tbl.columns) {
-			auto col_type = MySQLTypeToDuckDB(col.type_name, col.column_type, col.precision, col.scale);
+			auto col_type = TypeNameToDuckDB(col.type_name, col.column_type, col.precision, col.scale);
 			ColumnDefinition column(col.name, std::move(col_type));
 			if (!col.is_nullable) {
 				auto col_idx = create_info->columns.LogicalColumnCount();
