@@ -12,17 +12,4 @@ struct ColumnInfo {
 	int64_t scale = -1;
 };
 
-struct PhysicalTableInfo {
-	string host;
-	string db_name;
-	string table_name;
-};
-
-struct LogicTableInfo {
-	string logic_db;
-	string logic_table;
-	vector<PhysicalTableInfo> physical_tables;
-	vector<ColumnInfo> columns;
-};
-
 } // namespace duckdb

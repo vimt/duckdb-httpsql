@@ -15,7 +15,6 @@ using namespace duckdb_yyjson;
 
 namespace duckdb {
 
-// Map MySQL type names (from Go server) to DuckDB LogicalType
 static LogicalType MySQLTypeToDuckDB(const string &type_name, const string &column_type,
                                       int64_t precision, int64_t scale) {
 	auto lower = StringUtil::Lower(type_name);
@@ -41,12 +40,16 @@ static LogicalType MySQLTypeToDuckDB(const string &type_name, const string &colu
 	if (lower == "bit" || lower == "binary" || lower == "varbinary" ||
 	    lower == "tinyblob" || lower == "blob" || lower == "mediumblob" || lower == "longblob")
 		return LogicalType::BLOB;
-	// char, varchar, text, enum, set, json → VARCHAR
 	return LogicalType::VARCHAR;
 }
 
-static vector<LogicTableInfo> ParseTablesJSON(const string &json) {
-	vector<LogicTableInfo> result;
+struct TableParseResult {
+	string name;
+	vector<ColumnInfo> columns;
+};
+
+static vector<TableParseResult> ParseTablesJSON(const string &json) {
+	vector<TableParseResult> result;
 	auto *doc = yyjson_read(json.c_str(), json.size(), 0);
 	if (!doc) return result;
 	auto *root = yyjson_doc_get_root(doc);
@@ -56,32 +59,12 @@ static vector<LogicTableInfo> ParseTablesJSON(const string &json) {
 	yyjson_val *tobj;
 	yyjson_arr_foreach(root, tidx, tmax, tobj) {
 		if (!yyjson_is_obj(tobj)) continue;
-		LogicTableInfo info;
+		TableParseResult tbl;
 
-		auto *logic_db = yyjson_obj_get(tobj, "logic_db");
-		auto *logic_table = yyjson_obj_get(tobj, "logic_table");
-		if (logic_db && yyjson_is_str(logic_db)) info.logic_db = yyjson_get_str(logic_db);
-		if (logic_table && yyjson_is_str(logic_table)) info.logic_table = yyjson_get_str(logic_table);
+		auto *name = yyjson_obj_get(tobj, "name");
+		if (!name || !yyjson_is_str(name)) continue;
+		tbl.name = yyjson_get_str(name);
 
-		// Parse physical_tables
-		auto *pts = yyjson_obj_get(tobj, "physical_tables");
-		if (pts && yyjson_is_arr(pts)) {
-			size_t pidx, pmax;
-			yyjson_val *pobj;
-			yyjson_arr_foreach(pts, pidx, pmax, pobj) {
-				if (!yyjson_is_obj(pobj)) continue;
-				PhysicalTableInfo pt;
-				auto *host = yyjson_obj_get(pobj, "host");
-				auto *db_name = yyjson_obj_get(pobj, "db_name");
-				auto *table_name = yyjson_obj_get(pobj, "table_name");
-				if (host && yyjson_is_str(host)) pt.host = yyjson_get_str(host);
-				if (db_name && yyjson_is_str(db_name)) pt.db_name = yyjson_get_str(db_name);
-				if (table_name && yyjson_is_str(table_name)) pt.table_name = yyjson_get_str(table_name);
-				info.physical_tables.push_back(std::move(pt));
-			}
-		}
-
-		// Parse columns
 		auto *cols = yyjson_obj_get(tobj, "columns");
 		if (cols && yyjson_is_arr(cols)) {
 			size_t cidx, cmax;
@@ -89,23 +72,23 @@ static vector<LogicTableInfo> ParseTablesJSON(const string &json) {
 			yyjson_arr_foreach(cols, cidx, cmax, cobj) {
 				if (!yyjson_is_obj(cobj)) continue;
 				ColumnInfo col;
-				auto *name = yyjson_obj_get(cobj, "name");
+				auto *cname     = yyjson_obj_get(cobj, "name");
 				auto *type_name = yyjson_obj_get(cobj, "type_name");
-				auto *column_type = yyjson_obj_get(cobj, "column_type");
-				auto *nullable = yyjson_obj_get(cobj, "nullable");
+				auto *col_type  = yyjson_obj_get(cobj, "column_type");
+				auto *nullable  = yyjson_obj_get(cobj, "nullable");
 				auto *precision = yyjson_obj_get(cobj, "precision");
-				auto *scale = yyjson_obj_get(cobj, "scale");
-				if (name && yyjson_is_str(name)) col.name = yyjson_get_str(name);
-				if (type_name && yyjson_is_str(type_name)) col.type_name = yyjson_get_str(type_name);
-				if (column_type && yyjson_is_str(column_type)) col.column_type = yyjson_get_str(column_type);
-				if (nullable && yyjson_is_bool(nullable)) col.is_nullable = yyjson_get_bool(nullable);
+				auto *scale     = yyjson_obj_get(cobj, "scale");
+				if (cname     && yyjson_is_str(cname))     col.name        = yyjson_get_str(cname);
+				if (type_name && yyjson_is_str(type_name)) col.type_name   = yyjson_get_str(type_name);
+				if (col_type  && yyjson_is_str(col_type))  col.column_type = yyjson_get_str(col_type);
+				if (nullable  && yyjson_is_bool(nullable)) col.is_nullable = yyjson_get_bool(nullable);
 				if (precision) col.precision = yyjson_is_null(precision) ? -1 : (int64_t)yyjson_get_sint(precision);
-				if (scale) col.scale = yyjson_is_null(scale) ? -1 : (int64_t)yyjson_get_sint(scale);
-				info.columns.push_back(std::move(col));
+				if (scale)     col.scale     = yyjson_is_null(scale)     ? -1 : (int64_t)yyjson_get_sint(scale);
+				tbl.columns.push_back(std::move(col));
 			}
 		}
 
-		result.push_back(std::move(info));
+		result.push_back(std::move(tbl));
 	}
 	yyjson_doc_free(doc);
 	return result;
@@ -126,12 +109,11 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 		                  name, resp.status_code, resp.error);
 	}
 
-	auto table_list = ParseTablesJSON(resp.body);
-	for (auto &info : table_list) {
-		if (info.columns.empty()) continue;
+	for (auto &tbl : ParseTablesJSON(resp.body)) {
+		if (tbl.columns.empty()) continue;
 
-		auto create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)*this, info.logic_table);
-		for (auto &col : info.columns) {
+		auto create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)*this, tbl.name);
+		for (auto &col : tbl.columns) {
 			auto col_type = MySQLTypeToDuckDB(col.type_name, col.column_type, col.precision, col.scale);
 			ColumnDefinition column(col.name, std::move(col_type));
 			if (!col.is_nullable) {
@@ -141,9 +123,8 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 			create_info->columns.AddColumn(std::move(column));
 		}
 		if (create_info->columns.LogicalColumnCount() > 0) {
-			auto table_name = info.logic_table;
-			auto entry = make_uniq<HttpSQLTableEntry>(catalog, *this, *create_info, std::move(info));
-			tables_[table_name] = std::move(entry);
+			auto entry = make_uniq<HttpSQLTableEntry>(catalog, *this, *create_info);
+			tables_[tbl.name] = std::move(entry);
 		}
 	}
 	tables_loaded_ = true;

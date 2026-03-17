@@ -7,16 +7,13 @@ namespace duckdb {
 
 class HttpSQLTableEntry : public TableCatalogEntry {
 public:
-	HttpSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-	                    LogicTableInfo logic_table_info);
+	HttpSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info);
 
 	unique_ptr<BaseStatistics> GetStatistics(ClientContext &, column_t) override;
 	TableFunction GetScanFunction(ClientContext &context, unique_ptr<FunctionData> &bind_data) override;
 	TableStorageInfo GetStorageInfo(ClientContext &) override;
 	void BindUpdateConstraints(Binder &, LogicalGet &, LogicalProjection &, LogicalUpdate &,
 	                           ClientContext &) override;
-
-	LogicTableInfo logic_table_info;
 };
 
 } // namespace duckdb

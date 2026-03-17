@@ -144,7 +144,6 @@ static unique_ptr<GlobalTableFunctionState> HttpSQLInitGlobalState(ClientContext
 	auto &bind_data = input.bind_data->Cast<HttpSQLBindData>();
 	auto &table = bind_data.table;
 	auto &cat = table.catalog.Cast<HttpSQLCatalog>();
-	auto &info = table.logic_table_info;
 
 	auto gstate = make_uniq<HttpSQLGlobalState>();
 
@@ -167,8 +166,8 @@ static unique_ptr<GlobalTableFunctionState> HttpSQLInitGlobalState(ClientContext
 
 	// Build JSON request
 	string body = "{";
-	body += "\"schema\":\"" + info.logic_db + "\",";
-	body += "\"table\":\"" + info.logic_table + "\",";
+	body += "\"schema\":\"" + table.schema.name + "\",";
+	body += "\"table\":\"" + table.name + "\",";
 
 	// columns array
 	body += "\"columns\":[";
@@ -401,8 +400,8 @@ static void HttpSQLScan(ClientContext &context, TableFunctionInput &data, DataCh
 static InsertionOrderPreservingMap<string> HttpSQLToString(TableFunctionToStringInput &input) {
 	InsertionOrderPreservingMap<string> result;
 	auto &bind_data = input.bind_data->Cast<HttpSQLBindData>();
+	result["Schema"] = bind_data.table.schema.name;
 	result["Table"] = bind_data.table.name;
-	result["Shards"] = std::to_string(bind_data.table.logic_table_info.physical_tables.size());
 	return result;
 }
 

@@ -5,9 +5,8 @@
 
 namespace duckdb {
 
-HttpSQLTableEntry::HttpSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info,
-                                         LogicTableInfo logic_table_info_p)
-    : TableCatalogEntry(catalog, schema, info), logic_table_info(std::move(logic_table_info_p)) {
+HttpSQLTableEntry::HttpSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
+    : TableCatalogEntry(catalog, schema, info) {
 }
 
 unique_ptr<BaseStatistics> HttpSQLTableEntry::GetStatistics(ClientContext &, column_t) {
@@ -30,7 +29,7 @@ TableFunction HttpSQLTableEntry::GetScanFunction(ClientContext &, unique_ptr<Fun
 
 TableStorageInfo HttpSQLTableEntry::GetStorageInfo(ClientContext &) {
 	TableStorageInfo result;
-	result.cardinality = logic_table_info.physical_tables.size() * 1000; // rough estimate
+	result.cardinality = 0;
 	return result;
 }
 
