@@ -10,6 +10,7 @@ add_library(
   httpsql_schema_entry.cpp
   httpsql_table_entry.cpp
   httpsql_scanner.cpp
+  httpsql_arrow_reader.cpp
   httpsql_http_client.cpp
   httpsql_optimizer.cpp
   httpsql_transaction.cpp
