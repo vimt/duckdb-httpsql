@@ -23,3 +23,51 @@ jobs:
       exclude_archs: 'wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64'
       build_duckdb_shell: false
       skip_tests: true
+
+  release:
+    name: Create GitHub Release
+    runs-on: ubuntu-latest
+    needs: duckdb-stable-build
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: httpsql-v1.5.0-extension-*
+          path: artifacts
+          merge-multiple: false
+
+      - name: Rename extension files with platform suffix
+        run: |
+          mkdir release_files
+          for dir in artifacts/httpsql-v1.5.0-extension-*/; do
+            arch=$(basename "$dir" | sed 's/httpsql-v1\.5\.0-extension-//')
+            find "$dir" -type f | while read f; do
+              filename=$(basename "$f")
+              # Rename: httpsql.duckdb_extension -> httpsql-linux_amd64.duckdb_extension
+              newname=$(echo "$filename" | sed "s/httpsql\./httpsql-${arch}./")
+              cp "$f" "release_files/${newname}"
+            done
+          done
+          echo "Release files:"
+          ls -lh release_files/
+
+      - name: Create or Update Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="v1.5.0"
+          TITLE="httpsql for DuckDB v1.5.0"
+          BODY="Built from commit \`${{ github.sha }}\` (run #${{ github.run_number }})."
+          if gh release view "$TAG" --repo "${{ github.repository }}" &>/dev/null; then
+            # Release already exists: overwrite assets and update notes
+            gh release upload "$TAG" --repo "${{ github.repository }}" --clobber release_files/*
+            gh release edit "$TAG" --repo "${{ github.repository }}" --notes "$BODY"
+          else
+            gh release create "$TAG" \
+              --repo "${{ github.repository }}" \
+              --title "$TITLE" \
+              --notes "$BODY" \
+              release_files/*
+          fi
