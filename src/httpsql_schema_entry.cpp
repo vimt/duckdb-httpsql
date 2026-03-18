@@ -15,6 +15,45 @@ using namespace duckdb_yyjson;
 
 namespace duckdb {
 
+// DuckDBTypeToLogical parses a DuckDB type string as returned by the Go server's
+// duckdb_type field (e.g. "DECIMAL(10,4)", "TIMESTAMP", "JSON") into a LogicalType.
+// This is the primary path used when the server supplies duckdb_type.
+static LogicalType DuckDBTypeToLogical(const string &type) {
+	string upper = type;
+	StringUtil::Trim(upper);
+	StringUtil::Upper(upper);
+	if (upper == "TINYINT")   return LogicalType::TINYINT;
+	if (upper == "SMALLINT")  return LogicalType::SMALLINT;
+	if (upper == "INTEGER")   return LogicalType::INTEGER;
+	if (upper == "BIGINT")    return LogicalType::BIGINT;
+	if (upper == "UTINYINT")  return LogicalType::UTINYINT;
+	if (upper == "USMALLINT") return LogicalType::USMALLINT;
+	if (upper == "UINTEGER")  return LogicalType::UINTEGER;
+	if (upper == "UBIGINT")   return LogicalType::UBIGINT;
+	if (upper == "FLOAT")     return LogicalType::FLOAT;
+	if (upper == "DOUBLE")    return LogicalType::DOUBLE;
+	if (upper == "DATE")      return LogicalType::DATE;
+	if (upper == "TIMESTAMP") return LogicalType::TIMESTAMP;
+	if (upper == "TIME")      return LogicalType::TIME;
+	if (upper == "BLOB")      return LogicalType::BLOB;
+	if (upper == "JSON")      return LogicalType::JSON();
+	if (upper == "VARCHAR")   return LogicalType::VARCHAR;
+	// DECIMAL(precision,scale)
+	if (upper.substr(0, 7) == "DECIMAL") {
+		auto lp = upper.find('(');
+		auto cm = upper.find(',', lp);
+		auto rp = upper.find(')', cm);
+		if (lp != string::npos && cm != string::npos && rp != string::npos) {
+			int64_t p = std::stoll(upper.substr(lp + 1, cm - lp - 1));
+			int64_t s = std::stoll(upper.substr(cm + 1, rp - cm - 1));
+			return LogicalType::DECIMAL(p, s);
+		}
+	}
+	return LogicalType::VARCHAR;
+}
+
+// TypeNameToDuckDB is the legacy fallback used when the server does not supply
+// a duckdb_type field (older server versions).
 static LogicalType TypeNameToDuckDB(const string &type_name, const string &column_type,
                                       int64_t precision, int64_t scale) {
 	auto lower = StringUtil::Lower(type_name);
@@ -75,16 +114,18 @@ static vector<TableParseResult> ParseTablesJSON(const string &json) {
 				ColumnInfo col;
 				auto *cname     = yyjson_obj_get(cobj, "name");
 				auto *type_name = yyjson_obj_get(cobj, "type_name");
-				auto *col_type  = yyjson_obj_get(cobj, "column_type");
-				auto *nullable  = yyjson_obj_get(cobj, "nullable");
-				auto *precision = yyjson_obj_get(cobj, "precision");
-				auto *scale     = yyjson_obj_get(cobj, "scale");
-				if (cname     && yyjson_is_str(cname))     col.name        = yyjson_get_str(cname);
-				if (type_name && yyjson_is_str(type_name)) col.type_name   = yyjson_get_str(type_name);
-				if (col_type  && yyjson_is_str(col_type))  col.column_type = yyjson_get_str(col_type);
-				if (nullable  && yyjson_is_bool(nullable)) col.is_nullable = yyjson_get_bool(nullable);
-				if (precision) col.precision = yyjson_is_null(precision) ? -1 : (int64_t)yyjson_get_sint(precision);
-				if (scale)     col.scale     = yyjson_is_null(scale)     ? -1 : (int64_t)yyjson_get_sint(scale);
+				auto *col_type    = yyjson_obj_get(cobj, "column_type");
+				auto *nullable    = yyjson_obj_get(cobj, "nullable");
+				auto *precision   = yyjson_obj_get(cobj, "precision");
+				auto *scale       = yyjson_obj_get(cobj, "scale");
+				auto *duckdb_type = yyjson_obj_get(cobj, "duckdb_type");
+				if (cname       && yyjson_is_str(cname))       col.name        = yyjson_get_str(cname);
+				if (type_name   && yyjson_is_str(type_name))   col.type_name   = yyjson_get_str(type_name);
+				if (col_type    && yyjson_is_str(col_type))    col.column_type = yyjson_get_str(col_type);
+				if (nullable    && yyjson_is_bool(nullable))   col.is_nullable = yyjson_get_bool(nullable);
+				if (precision)  col.precision = yyjson_is_null(precision) ? -1 : (int64_t)yyjson_get_sint(precision);
+				if (scale)      col.scale     = yyjson_is_null(scale)     ? -1 : (int64_t)yyjson_get_sint(scale);
+				if (duckdb_type && yyjson_is_str(duckdb_type)) col.duckdb_type = yyjson_get_str(duckdb_type);
 				tbl.columns.push_back(std::move(col));
 			}
 		}
@@ -115,7 +156,9 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 
 		auto create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)*this, tbl.name);
 		for (auto &col : tbl.columns) {
-			auto col_type = TypeNameToDuckDB(col.type_name, col.column_type, col.precision, col.scale);
+			auto col_type = !col.duckdb_type.empty()
+			    ? DuckDBTypeToLogical(col.duckdb_type)
+			    : TypeNameToDuckDB(col.type_name, col.column_type, col.precision, col.scale);
 			ColumnDefinition column(col.name, std::move(col_type));
 			if (!col.is_nullable) {
 				auto col_idx = create_info->columns.LogicalColumnCount();
