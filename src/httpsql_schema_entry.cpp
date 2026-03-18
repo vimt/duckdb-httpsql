@@ -15,9 +15,8 @@ using namespace duckdb_yyjson;
 
 namespace duckdb {
 
-// DuckDBTypeToLogical parses a DuckDB type string as returned by the Go server's
+// DuckDBTypeToLogical parses a DuckDB type string supplied by the Go server's
 // duckdb_type field (e.g. "DECIMAL(10,4)", "TIMESTAMP", "JSON") into a LogicalType.
-// This is the primary path used when the server supplies duckdb_type.
 static LogicalType DuckDBTypeToLogical(const string &type) {
 	string upper = type;
 	StringUtil::Trim(upper);
@@ -52,37 +51,6 @@ static LogicalType DuckDBTypeToLogical(const string &type) {
 	return LogicalType::VARCHAR;
 }
 
-// TypeNameToDuckDB is the legacy fallback used when the server does not supply
-// a duckdb_type field (older server versions).
-static LogicalType TypeNameToDuckDB(const string &type_name, const string &column_type,
-                                      int64_t precision, int64_t scale) {
-	auto lower = StringUtil::Lower(type_name);
-	bool is_unsigned = column_type.find("unsigned") != string::npos;
-
-	if (lower == "tinyint") return is_unsigned ? LogicalType::UTINYINT : LogicalType::TINYINT;
-	if (lower == "smallint") return is_unsigned ? LogicalType::USMALLINT : LogicalType::SMALLINT;
-	if (lower == "mediumint" || lower == "int" || lower == "integer")
-		return is_unsigned ? LogicalType::UINTEGER : LogicalType::INTEGER;
-	if (lower == "bigint") return is_unsigned ? LogicalType::UBIGINT : LogicalType::BIGINT;
-	if (lower == "float") return LogicalType::FLOAT;
-	if (lower == "double" || lower == "real") return LogicalType::DOUBLE;
-	if (lower == "decimal" || lower == "numeric") {
-		if (precision > 0 && precision <= 38) {
-			return LogicalType::DECIMAL(precision, scale >= 0 ? scale : 0);
-		}
-		return LogicalType::DOUBLE;
-	}
-	if (lower == "date") return LogicalType::DATE;
-	if (lower == "datetime" || lower == "timestamp") return LogicalType::TIMESTAMP;
-	if (lower == "time") return LogicalType::TIME;
-	if (lower == "year") return LogicalType::INTEGER;
-	if (lower == "bit" || lower == "binary" || lower == "varbinary" ||
-	    lower == "tinyblob" || lower == "blob" || lower == "mediumblob" || lower == "longblob")
-		return LogicalType::BLOB;
-	if (lower == "json") return LogicalType::JSON();
-	return LogicalType::VARCHAR;
-}
-
 struct TableParseResult {
 	string name;
 	vector<ColumnInfo> columns;
@@ -112,19 +80,11 @@ static vector<TableParseResult> ParseTablesJSON(const string &json) {
 			yyjson_arr_foreach(cols, cidx, cmax, cobj) {
 				if (!yyjson_is_obj(cobj)) continue;
 				ColumnInfo col;
-				auto *cname     = yyjson_obj_get(cobj, "name");
-				auto *type_name = yyjson_obj_get(cobj, "type_name");
-				auto *col_type    = yyjson_obj_get(cobj, "column_type");
+				auto *cname       = yyjson_obj_get(cobj, "name");
 				auto *nullable    = yyjson_obj_get(cobj, "nullable");
-				auto *precision   = yyjson_obj_get(cobj, "precision");
-				auto *scale       = yyjson_obj_get(cobj, "scale");
 				auto *duckdb_type = yyjson_obj_get(cobj, "duckdb_type");
 				if (cname       && yyjson_is_str(cname))       col.name        = yyjson_get_str(cname);
-				if (type_name   && yyjson_is_str(type_name))   col.type_name   = yyjson_get_str(type_name);
-				if (col_type    && yyjson_is_str(col_type))    col.column_type = yyjson_get_str(col_type);
 				if (nullable    && yyjson_is_bool(nullable))   col.is_nullable = yyjson_get_bool(nullable);
-				if (precision)  col.precision = yyjson_is_null(precision) ? -1 : (int64_t)yyjson_get_sint(precision);
-				if (scale)      col.scale     = yyjson_is_null(scale)     ? -1 : (int64_t)yyjson_get_sint(scale);
 				if (duckdb_type && yyjson_is_str(duckdb_type)) col.duckdb_type = yyjson_get_str(duckdb_type);
 				tbl.columns.push_back(std::move(col));
 			}
@@ -156,10 +116,7 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 
 		auto create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)*this, tbl.name);
 		for (auto &col : tbl.columns) {
-			auto col_type = !col.duckdb_type.empty()
-			    ? DuckDBTypeToLogical(col.duckdb_type)
-			    : TypeNameToDuckDB(col.type_name, col.column_type, col.precision, col.scale);
-			ColumnDefinition column(col.name, std::move(col_type));
+			ColumnDefinition column(col.name, DuckDBTypeToLogical(col.duckdb_type));
 			if (!col.is_nullable) {
 				auto col_idx = create_info->columns.LogicalColumnCount();
 				create_info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(col_idx)));
