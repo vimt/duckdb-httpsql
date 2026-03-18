@@ -81,7 +81,8 @@ struct ConnReader {
 
 // ─── Constructor / Destructor ─────────────────────────────────────────────────
 
-HttpSQLHttpClient::HttpSQLHttpClient(const std::string &base_url) {
+HttpSQLHttpClient::HttpSQLHttpClient(const std::string &base_url, int timeout_sec)
+    : timeout_sec_(timeout_sec) {
 	ParseURL(base_url, host_, port_);
 
 	struct addrinfo hints {}, *res = nullptr;
@@ -111,6 +112,13 @@ int HttpSQLHttpClient::NewConn() {
 	if (fd < 0) return -1;
 	int one = 1;
 	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	if (timeout_sec_ > 0) {
+		struct timeval tv;
+		tv.tv_sec  = timeout_sec_;
+		tv.tv_usec = 0;
+		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+	}
 	if (connect(fd, (struct sockaddr *)&server_addr_, server_addr_len_) < 0) {
 		close(fd);
 		return -1;

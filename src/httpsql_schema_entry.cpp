@@ -40,6 +40,7 @@ static LogicalType TypeNameToDuckDB(const string &type_name, const string &colum
 	if (lower == "bit" || lower == "binary" || lower == "varbinary" ||
 	    lower == "tinyblob" || lower == "blob" || lower == "mediumblob" || lower == "longblob")
 		return LogicalType::BLOB;
+	if (lower == "json") return LogicalType::JSON();
 	return LogicalType::VARCHAR;
 }
 

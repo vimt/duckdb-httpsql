@@ -9,8 +9,8 @@ using namespace duckdb_yyjson;
 
 namespace duckdb {
 
-HttpSQLCatalog::HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url)
-    : Catalog(db_p), http(server_url), server_url_(server_url) {
+HttpSQLCatalog::HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url, int timeout_sec)
+    : Catalog(db_p), http(server_url, timeout_sec), server_url_(server_url) {
 }
 
 void HttpSQLCatalog::Initialize(bool) {}

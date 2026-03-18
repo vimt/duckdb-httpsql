@@ -19,7 +19,8 @@ struct HttpResponse {
 // requests. On failure the request is retried on a fresh connection.
 class HttpSQLHttpClient {
 public:
-	explicit HttpSQLHttpClient(const std::string &base_url);
+	// timeout_sec: SO_RCVTIMEO / SO_SNDTIMEO on each socket. 0 = no timeout.
+	explicit HttpSQLHttpClient(const std::string &base_url, int timeout_sec = 30);
 	~HttpSQLHttpClient();
 
 	HttpResponse Get(const std::string &path);
@@ -28,6 +29,7 @@ public:
 private:
 	std::string host_;
 	int port_ = 80;
+	int timeout_sec_ = 30;
 
 	// Resolved once in constructor
 	struct sockaddr_storage server_addr_ {};

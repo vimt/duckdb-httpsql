@@ -5,12 +5,15 @@
 #include "httpsql_ipc_stream.hpp"
 
 #include "duckdb/function/table/arrow.hpp"
+#include "yyjson.hpp"
 
 #include "duckdb/planner/filter/conjunction_filter.hpp"
 #include "duckdb/planner/filter/constant_filter.hpp"
 #include "duckdb/planner/filter/null_filter.hpp"
 #include "duckdb/planner/filter/in_filter.hpp"
 #include "duckdb/planner/filter/optional_filter.hpp"
+
+using namespace duckdb_yyjson;
 
 namespace duckdb {
 
@@ -173,27 +176,27 @@ unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowS
 	string where_clause = BuildWhereClause(parameters, bind.all_names);
 
 	// ── Assemble JSON request body ─────────────────────────────────────────
-	string body = "{";
-	body += "\"schema\":\"" + table.schema.name + "\",";
-	body += "\"table\":\"" + table.name + "\",";
+	yyjson_mut_doc *jdoc = yyjson_mut_doc_new(nullptr);
+	yyjson_mut_val *jroot = yyjson_mut_obj(jdoc);
+	yyjson_mut_doc_set_root(jdoc, jroot);
 
-	body += "\"columns\":[";
-	for (idx_t i = 0; i < col_names.size(); i++) {
-		if (i > 0) {
-			body += ",";
-		}
-		body += "\"" + col_names[i] + "\"";
+	yyjson_mut_obj_add_strcpy(jdoc, jroot, "schema", table.schema.name.c_str());
+	yyjson_mut_obj_add_strcpy(jdoc, jroot, "table", table.name.c_str());
+
+	yyjson_mut_val *jcols = yyjson_mut_arr(jdoc);
+	yyjson_mut_obj_add_val(jdoc, jroot, "columns", jcols);
+	for (auto &c : col_names) {
+		yyjson_mut_arr_add_strcpy(jdoc, jcols, c.c_str());
 	}
-	body += "]";
 
 	if (!where_clause.empty()) {
-		body += ",\"where\":\"" + StringUtil::Replace(where_clause, "\"", "\\\"") + "\"";
+		yyjson_mut_obj_add_strcpy(jdoc, jroot, "where", where_clause.c_str());
 	}
 	if (!bind.limit_clause.empty()) {
-		body += ",\"limit\":\"" + bind.limit_clause + "\"";
+		yyjson_mut_obj_add_strcpy(jdoc, jroot, "limit", bind.limit_clause.c_str());
 	}
 	if (!bind.order_clause.empty()) {
-		body += ",\"order\":\"" + bind.order_clause + "\"";
+		yyjson_mut_obj_add_strcpy(jdoc, jroot, "order", bind.order_clause.c_str());
 	}
 	if (agg_mode) {
 		auto &pd = *bind.agg_pushdown;
@@ -204,7 +207,7 @@ unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowS
 			}
 			agg_select += pd.output_cols[i].sql_expr;
 		}
-		body += ",\"agg_select\":\"" + StringUtil::Replace(agg_select, "\"", "\\\"") + "\"";
+		yyjson_mut_obj_add_strcpy(jdoc, jroot, "agg_select", agg_select.c_str());
 		if (!pd.group_col_names.empty()) {
 			string group_by;
 			for (idx_t i = 0; i < pd.group_col_names.size(); i++) {
@@ -213,10 +216,15 @@ unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowS
 				}
 				group_by += pd.group_col_names[i];
 			}
-			body += ",\"agg_group_by\":\"" + group_by + "\"";
+			yyjson_mut_obj_add_strcpy(jdoc, jroot, "agg_group_by", group_by.c_str());
 		}
 	}
-	body += "}";
+
+	size_t json_len = 0;
+	char *json_raw = yyjson_mut_write(jdoc, 0, &json_len);
+	string body(json_raw, json_len);
+	free(json_raw);
+	yyjson_mut_doc_free(jdoc);
 
 	Printer::Print(StringUtil::Format("[httpsql] POST /api/query: %s", body.substr(0, 300)));
 

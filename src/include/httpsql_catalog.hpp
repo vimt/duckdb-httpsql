@@ -9,7 +9,7 @@ namespace duckdb {
 
 class HttpSQLCatalog : public Catalog {
 public:
-	HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url);
+	HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url, int timeout_sec = 30);
 	~HttpSQLCatalog() override = default;
 
 	HttpSQLHttpClient http;

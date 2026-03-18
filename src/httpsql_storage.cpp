@@ -19,8 +19,18 @@ static unique_ptr<Catalog> HttpSQLAttach(optional_ptr<StorageExtensionInfo>, Cli
 		throw BinderException("httpsql requires a server URL: ATTACH 'http://host:port' AS name (TYPE httpsql)");
 	}
 
+	int64_t timeout_sec = 30;
+	auto timeout_it = info.options.find("timeout");
+	if (timeout_it != info.options.end()) {
+		try {
+			timeout_sec = timeout_it->second.GetValue<int64_t>();
+		} catch (...) {
+			throw BinderException("httpsql: 'timeout' option must be an integer (seconds)");
+		}
+	}
+
 	attach_options.access_mode = AccessMode::READ_ONLY;
-	return make_uniq<HttpSQLCatalog>(db, url);
+	return make_uniq<HttpSQLCatalog>(db, url, (int)timeout_sec);
 }
 
 static unique_ptr<TransactionManager> HttpSQLCreateTransactionManager(
