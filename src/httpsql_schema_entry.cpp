@@ -28,7 +28,7 @@ static LogicalType TypeNameToDuckDB(const string &type_name, const string &colum
 	if (lower == "float") return LogicalType::FLOAT;
 	if (lower == "double" || lower == "real") return LogicalType::DOUBLE;
 	if (lower == "decimal" || lower == "numeric") {
-		if (precision > 0) {
+		if (precision > 0 && precision <= 38) {
 			return LogicalType::DECIMAL(precision, scale >= 0 ? scale : 0);
 		}
 		return LogicalType::DOUBLE;
