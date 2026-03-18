@@ -226,8 +226,6 @@ unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowS
 	free(json_raw);
 	yyjson_mut_doc_free(jdoc);
 
-	Printer::Print(StringUtil::Format("[httpsql] POST /api/query: %s", body.substr(0, 300)));
-
 	auto resp = cat.http.Post("/api/query", body);
 	if (!resp.ok()) {
 		throw IOException("httpsql: POST /api/query failed (status %d): %s", resp.status_code,
