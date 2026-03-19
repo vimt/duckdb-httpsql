@@ -16,7 +16,8 @@ static unique_ptr<Catalog> HttpSQLAttach(optional_ptr<StorageExtensionInfo>, Cli
 
 	string url = info.path;
 	if (url.empty()) {
-		throw BinderException("httpsql requires a server URL: ATTACH 'http://host:port' AS name (TYPE httpsql)");
+		throw BinderException("httpsql requires a server URL: ATTACH 'http://host:port' AS name (TYPE httpsql)  "
+		                      "or ATTACH 'http+unix:///path/to/socket' AS name (TYPE httpsql)");
 	}
 
 	int64_t timeout_sec = 30;

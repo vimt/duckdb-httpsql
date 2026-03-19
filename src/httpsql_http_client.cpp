@@ -4,6 +4,7 @@
 #include <netdb.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/un.h>
 #include <unistd.h>
 
 #include <cctype>
@@ -14,6 +15,18 @@
 namespace duckdb {
 
 // ─── URL parsing ──────────────────────────────────────────────────────────────
+
+// Returns true if url is http+unix scheme, and sets unix_path.
+// http+unix:///var/run/httpsql.sock  →  unix_path = "/var/run/httpsql.sock"
+static bool ParseUnixURL(const std::string &url, std::string &unix_path) {
+	const std::string prefix = "http+unix://";
+	if (url.substr(0, prefix.size()) != prefix) return false;
+	// Everything after "http+unix://" up to '?' is the socket path.
+	std::string rest = url.substr(prefix.size());
+	auto qpos = rest.find('?');
+	unix_path = (qpos != std::string::npos) ? rest.substr(0, qpos) : rest;
+	return true;
+}
 
 static void ParseURL(const std::string &url, std::string &host, int &port) {
 	std::string u = url;
@@ -83,18 +96,22 @@ struct ConnReader {
 
 HttpSQLHttpClient::HttpSQLHttpClient(const std::string &base_url, int timeout_sec)
     : timeout_sec_(timeout_sec) {
-	ParseURL(base_url, host_, port_);
-
-	struct addrinfo hints {}, *res = nullptr;
-	hints.ai_family   = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	if (getaddrinfo(host_.c_str(), std::to_string(port_).c_str(), &hints, &res) == 0 && res) {
-		memcpy(&server_addr_, res->ai_addr, res->ai_addrlen);
-		server_addr_len_ = (socklen_t)res->ai_addrlen;
-		addr_family_     = res->ai_family;
-		sock_proto_      = res->ai_protocol;
-		addr_resolved_   = true;
-		freeaddrinfo(res);
+	if (ParseUnixURL(base_url, unix_path_)) {
+		is_unix_ = true;
+		host_ = "localhost";  // used only in HTTP Host header
+	} else {
+		ParseURL(base_url, host_, port_);
+		struct addrinfo hints {}, *res = nullptr;
+		hints.ai_family   = AF_UNSPEC;
+		hints.ai_socktype = SOCK_STREAM;
+		if (getaddrinfo(host_.c_str(), std::to_string(port_).c_str(), &hints, &res) == 0 && res) {
+			memcpy(&server_addr_, res->ai_addr, res->ai_addrlen);
+			server_addr_len_ = (socklen_t)res->ai_addrlen;
+			addr_family_     = res->ai_family;
+			sock_proto_      = res->ai_protocol;
+			addr_resolved_   = true;
+			freeaddrinfo(res);
+		}
 	}
 }
 
@@ -107,21 +124,34 @@ HttpSQLHttpClient::~HttpSQLHttpClient() {
 // ─── Connection pool ──────────────────────────────────────────────────────────
 
 int HttpSQLHttpClient::NewConn() {
-	if (!addr_resolved_) return -1;
-	int fd = socket(addr_family_, SOCK_STREAM, sock_proto_);
-	if (fd < 0) return -1;
-	int one = 1;
-	setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+	int fd = -1;
+
+	if (is_unix_) {
+		fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (fd < 0) return -1;
+		struct sockaddr_un addr {};
+		addr.sun_family = AF_UNIX;
+		strncpy(addr.sun_path, unix_path_.c_str(), sizeof(addr.sun_path) - 1);
+		if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+			close(fd);
+			return -1;
+		}
+	} else {
+		if (!addr_resolved_) return -1;
+		fd = socket(addr_family_, SOCK_STREAM, sock_proto_);
+		if (fd < 0) return -1;
+		int one = 1;
+		setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+		if (connect(fd, (struct sockaddr *)&server_addr_, server_addr_len_) < 0) {
+			close(fd);
+			return -1;
+		}
+	}
+
 	if (timeout_sec_ > 0) {
-		struct timeval tv;
-		tv.tv_sec  = timeout_sec_;
-		tv.tv_usec = 0;
+		struct timeval tv { timeout_sec_, 0 };
 		setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 		setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-	}
-	if (connect(fd, (struct sockaddr *)&server_addr_, server_addr_len_) < 0) {
-		close(fd);
-		return -1;
 	}
 	return fd;
 }

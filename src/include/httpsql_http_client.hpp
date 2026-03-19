@@ -15,6 +15,11 @@ struct HttpResponse {
 };
 
 // Synchronous HTTP/1.1 client with persistent connection pool.
+//
+// Supported URL formats:
+//   http://host:port[/path]          — TCP connection
+//   http+unix:///abs/path/to.sock    — Unix domain socket
+//
 // DNS is resolved once at construction. Idle connections are reused across
 // requests. On failure the request is retried on a fresh connection.
 class HttpSQLHttpClient {
@@ -27,11 +32,14 @@ public:
 	HttpResponse Post(const std::string &path, const std::string &body);
 
 private:
+	bool is_unix_ = false;
+	std::string unix_path_;   // used when is_unix_ == true
+
 	std::string host_;
 	int port_ = 80;
 	int timeout_sec_ = 30;
 
-	// Resolved once in constructor
+	// Resolved once in constructor (TCP only)
 	struct sockaddr_storage server_addr_ {};
 	socklen_t server_addr_len_ = 0;
 	int addr_family_ = 0;
