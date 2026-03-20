@@ -128,6 +128,30 @@ static string TransformFilter(const string &col, const TableFilter &filter) {
 	}
 }
 
+// Build WHERE clause directly from a LogicalGet's table_filters.
+// The keys in table_filters.filters are physical column indices (as set by
+// DuckDB's FilterPushdown pass).  names must be the full original column list
+// (bind_data.all_names).  Called by the optimizer before the agg-pushdown
+// column rewrite replaces column_ids and makes the physical indices invalid.
+string HttpSQLBuildWhereFromTableFilters(const TableFilterSet &filters, const vector<string> &names) {
+	if (filters.filters.empty()) {
+		return "";
+	}
+	vector<string> parts;
+	for (auto &kv : filters.filters) {
+		idx_t phys_col = kv.first; // physical column index
+		if (phys_col == COLUMN_IDENTIFIER_ROW_ID || phys_col >= names.size()) {
+			continue;
+		}
+		string col_name = "`" + names[phys_col] + "`";
+		auto s = TransformFilter(col_name, *kv.second);
+		if (!s.empty()) {
+			parts.push_back(s);
+		}
+	}
+	return parts.empty() ? "" : StringUtil::Join(parts, " AND ");
+}
+
 // Build WHERE clause from ArrowStreamParameters::filters.
 // filter_to_col maps filter column index → physical schema column index.
 static string BuildWhereClause(const ArrowStreamParameters &parameters, const vector<string> &all_names) {
@@ -175,7 +199,16 @@ unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowS
 	}
 
 	// ── Build WHERE clause ──────────────────────────────────────────────────
-	string where_clause = BuildWhereClause(parameters, bind.all_names);
+	// In agg mode the optimizer has already rewritten LogicalGet's columns to
+	// virtual names (_a0, _g0 …), so parameters.filters / filter_to_col no
+	// longer map to real columns.  Use the pre-computed clause saved before the
+	// rewrite.  In non-agg mode use the live parameters as usual.
+	string where_clause;
+	if (agg_mode) {
+		where_clause = bind.agg_where_clause;
+	} else {
+		where_clause = BuildWhereClause(parameters, bind.all_names);
+	}
 
 	// ── Assemble JSON request body ─────────────────────────────────────────
 	yyjson_mut_doc *jdoc = yyjson_mut_doc_new(nullptr);

@@ -272,6 +272,15 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 		pushdown->output_cols.push_back({info.sql_expr});
 	}
 
+	// ── Bug fix: save WHERE clause before the column rewrite ────────────────
+	// After SetColumnIds/names the old filter_to_col mapping is invalid; save
+	// the SQL WHERE string now so HttpSQLProduce can use it in agg mode.
+	if (!get.table_filters.filters.empty()) {
+		bind_data.agg_where_clause =
+		    HttpSQLBuildWhereFromTableFilters(get.table_filters, bind_data.all_names);
+		get.table_filters.filters.clear();
+	}
+
 	vector<ColumnIndex> new_col_ids;
 	for (idx_t i = 0; i < total_cols; i++) new_col_ids.push_back(ColumnIndex(i));
 	get.SetColumnIds(std::move(new_col_ids));
@@ -332,6 +341,22 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 			                                             AggregateType::NON_DISTINCT);
 			break;
 		}
+		}
+	}
+
+	// ── Bug fix: bypass intermediate projections between aggregate and Get ──
+	// SELECT * (or any subquery that adds a LogicalProjection) leaves a
+	// projection whose expressions reference the original Get column bindings.
+	// After the virtual-column rewrite those bindings are invalid; remove the
+	// intermediate projection(s) by making the aggregate's direct child the Get.
+	if (agg.children[0].get() != &child) {
+		LogicalOperator *cur = agg.children[0].get();
+		while (cur->type == LogicalOperatorType::LOGICAL_PROJECTION && !cur->children.empty() &&
+		       cur->children[0].get() != &child) {
+			cur = cur->children[0].get();
+		}
+		if (!cur->children.empty() && cur->children[0].get() == &child) {
+			agg.children[0] = std::move(cur->children[0]);
 		}
 	}
 
