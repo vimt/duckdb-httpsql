@@ -1,12 +1,13 @@
 #pragma once
 #include "duckdb/catalog/catalog_entry/schema_catalog_entry.hpp"
 #include "duckdb/common/mutex.hpp"
+#include <chrono>
 
 namespace duckdb {
 
 class HttpSQLSchemaEntry : public SchemaCatalogEntry {
 public:
-	HttpSQLSchemaEntry(Catalog &catalog, CreateSchemaInfo &info);
+	HttpSQLSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, int ttl_sec = 60);
 
 	optional_ptr<CatalogEntry> CreateTable(CatalogTransaction, BoundCreateTableInfo &) override;
 	optional_ptr<CatalogEntry> CreateFunction(CatalogTransaction, CreateFunctionInfo &) override;
@@ -29,8 +30,10 @@ public:
 private:
 	void EnsureTablesLoaded(ClientContext &context);
 
+	int ttl_sec_;
 	unordered_map<string, unique_ptr<CatalogEntry>> tables_;
 	bool tables_loaded_ = false;
+	std::chrono::steady_clock::time_point tables_loaded_at_;
 	mutex tables_lock_;
 };
 

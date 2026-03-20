@@ -4,12 +4,13 @@
 #include "httpsql_http_client.hpp"
 #include "httpsql_config.hpp"
 #include "httpsql_schema_entry.hpp"
+#include <chrono>
 
 namespace duckdb {
 
 class HttpSQLCatalog : public Catalog {
 public:
-	HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url, int timeout_sec = 30);
+	HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url, int timeout_sec = 30, int schema_ttl_sec = 60);
 	~HttpSQLCatalog() override = default;
 
 	HttpSQLHttpClient http;
@@ -42,8 +43,10 @@ private:
 	void EnsureSchemasLoaded();
 
 	string server_url_;
+	int schema_ttl_sec_;
 	unordered_map<string, unique_ptr<HttpSQLSchemaEntry>> schema_entries_;
 	bool schemas_loaded_ = false;
+	std::chrono::steady_clock::time_point schemas_loaded_at_;
 	mutex schema_lock_;
 };
 

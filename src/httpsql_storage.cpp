@@ -30,8 +30,23 @@ static unique_ptr<Catalog> HttpSQLAttach(optional_ptr<StorageExtensionInfo>, Cli
 		}
 	}
 
+	int64_t schema_ttl_sec = 60;
+	auto ttl_it = info.options.find("schema_ttl");
+	if (ttl_it != info.options.end()) {
+		try {
+			schema_ttl_sec = ttl_it->second.GetValue<int64_t>();
+			if (schema_ttl_sec < 0) {
+				throw BinderException("httpsql: 'schema_ttl' must be >= 0 (0 = never expire)");
+			}
+		} catch (BinderException &) {
+			throw;
+		} catch (...) {
+			throw BinderException("httpsql: 'schema_ttl' option must be an integer (seconds)");
+		}
+	}
+
 	attach_options.access_mode = AccessMode::READ_ONLY;
-	return make_uniq<HttpSQLCatalog>(db, url, (int)timeout_sec);
+	return make_uniq<HttpSQLCatalog>(db, url, (int)timeout_sec, (int)schema_ttl_sec);
 }
 
 static unique_ptr<TransactionManager> HttpSQLCreateTransactionManager(

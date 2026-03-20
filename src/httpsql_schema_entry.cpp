@@ -96,13 +96,20 @@ static vector<TableParseResult> ParseTablesJSON(const string &json) {
 	return result;
 }
 
-HttpSQLSchemaEntry::HttpSQLSchemaEntry(Catalog &catalog, CreateSchemaInfo &info)
-    : SchemaCatalogEntry(catalog, info) {
+HttpSQLSchemaEntry::HttpSQLSchemaEntry(Catalog &catalog, CreateSchemaInfo &info, int ttl_sec)
+    : SchemaCatalogEntry(catalog, info), ttl_sec_(ttl_sec) {
 }
 
 void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 	lock_guard<mutex> l(tables_lock_);
-	if (tables_loaded_) return;
+	if (tables_loaded_) {
+		if (ttl_sec_ == 0) return;
+		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+		    std::chrono::steady_clock::now() - tables_loaded_at_).count();
+		if (elapsed < ttl_sec_) return;
+		tables_.clear();
+		tables_loaded_ = false;
+	}
 
 	auto &cat = catalog.Cast<HttpSQLCatalog>();
 	auto resp = cat.http.Get("/api/schemas/" + name + "/tables");
@@ -128,6 +135,7 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 			tables_[tbl.name] = std::move(entry);
 		}
 	}
+	tables_loaded_at_ = std::chrono::steady_clock::now();
 	tables_loaded_ = true;
 }
 

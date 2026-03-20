@@ -135,7 +135,9 @@ static string BuildWhereClause(const ArrowStreamParameters &parameters, const ve
 		return "";
 	}
 	vector<string> parts;
-	for (auto &[filter_col_idx, filter] : parameters.filters->filters) {
+	for (auto &kv : parameters.filters->filters) {
+		auto filter_col_idx = kv.first;
+		auto &filter = kv.second;
 		// Map filter column index → physical column index.
 		auto it = parameters.projected_columns.filter_to_col.find(filter_col_idx);
 		if (it == parameters.projected_columns.filter_to_col.end()) {

@@ -9,8 +9,8 @@ using namespace duckdb_yyjson;
 
 namespace duckdb {
 
-HttpSQLCatalog::HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url, int timeout_sec)
-    : Catalog(db_p), http(server_url, timeout_sec), server_url_(server_url) {
+HttpSQLCatalog::HttpSQLCatalog(AttachedDatabase &db_p, const string &server_url, int timeout_sec, int schema_ttl_sec)
+    : Catalog(db_p), http(server_url, timeout_sec), server_url_(server_url), schema_ttl_sec_(schema_ttl_sec) {
 }
 
 void HttpSQLCatalog::Initialize(bool) {}
@@ -31,9 +31,16 @@ static vector<string> ParseStringArray(const string &json) {
 	return result;
 }
 
-// Fetches /api/schemas once and populates schema_entries_. Must be called under schema_lock_.
+// Fetches /api/schemas and populates schema_entries_. Must be called under schema_lock_.
 void HttpSQLCatalog::EnsureSchemasLoaded() {
-	if (schemas_loaded_) return;
+	if (schemas_loaded_) {
+		if (schema_ttl_sec_ == 0) return;
+		auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+		    std::chrono::steady_clock::now() - schemas_loaded_at_).count();
+		if (elapsed < schema_ttl_sec_) return;
+		schema_entries_.clear();
+		schemas_loaded_ = false;
+	}
 
 	auto resp = http.Get("/api/schemas");
 	if (!resp.ok()) {
@@ -44,17 +51,18 @@ void HttpSQLCatalog::EnsureSchemasLoaded() {
 		if (schema_entries_.find(name) == schema_entries_.end()) {
 			CreateSchemaInfo info;
 			info.schema = name;
-			schema_entries_[name] = make_uniq<HttpSQLSchemaEntry>(*this, info);
+			schema_entries_[name] = make_uniq<HttpSQLSchemaEntry>(*this, info, schema_ttl_sec_);
 		}
 	}
+	schemas_loaded_at_ = std::chrono::steady_clock::now();
 	schemas_loaded_ = true;
 }
 
 void HttpSQLCatalog::ScanSchemas(ClientContext &, std::function<void(SchemaCatalogEntry &)> callback) {
 	lock_guard<mutex> l(schema_lock_);
 	EnsureSchemasLoaded();
-	for (auto &[name, entry] : schema_entries_) {
-		callback(*entry);
+	for (auto &kv : schema_entries_) {
+		callback(*kv.second);
 	}
 }
 
