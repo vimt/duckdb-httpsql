@@ -300,4 +300,295 @@ HttpResponse HttpSQLHttpClient::Post(const std::string &path, const std::string 
 	return DoRequest("POST", path, body);
 }
 
+// ─── HttpSQLBodyStream ────────────────────────────────────────────────────────
+
+HttpSQLBodyStream::HttpSQLBodyStream(HttpSQLHttpClient *client, int fd,
+                                     const char *buf_data, size_t buf_start, size_t buf_end,
+                                     bool is_chunked, int64_t content_length)
+    : client_(client), fd_(fd), buf_start_(buf_start), buf_end_(buf_end),
+      is_chunked_(is_chunked), content_remaining_(content_length) {
+	memcpy(buf_, buf_data, buf_end);
+	if (!is_chunked_ && content_length == 0) {
+		finished_ = true;
+	}
+}
+
+HttpSQLBodyStream::~HttpSQLBodyStream() {
+	if (fd_ >= 0) {
+		if (finished_ && error_.empty()) {
+			client_->ReleaseConn(fd_);
+		} else {
+			client_->CloseConn(fd_);
+		}
+	}
+}
+
+bool HttpSQLBodyStream::FillBuf() {
+	if (buf_eof_) {
+		return false;
+	}
+	ssize_t n = recv(fd_, buf_, sizeof(buf_), 0);
+	if (n <= 0) {
+		buf_eof_ = true;
+		return false;
+	}
+	buf_start_ = 0;
+	buf_end_ = (size_t)n;
+	return true;
+}
+
+bool HttpSQLBodyStream::ReadByte(char &c) {
+	if (buf_start_ >= buf_end_ && !FillBuf()) {
+		return false;
+	}
+	c = buf_[buf_start_++];
+	return true;
+}
+
+bool HttpSQLBodyStream::ReadLine(std::string &line) {
+	line.clear();
+	char c;
+	while (ReadByte(c)) {
+		if (c == '\r') {
+			ReadByte(c); // consume \n
+			return true;
+		}
+		line += c;
+	}
+	return false;
+}
+
+// Read next chunk-size line. Returns false if stream is finished or on error.
+bool HttpSQLBodyStream::AdvanceChunk() {
+	std::string line;
+	while (true) {
+		if (!ReadLine(line)) {
+			error_ = "connection closed while reading chunk header";
+			return false;
+		}
+		// Strip chunk extensions (after ';')
+		auto semi = line.find(';');
+		if (semi != std::string::npos) {
+			line.resize(semi);
+		}
+		// Trim trailing whitespace
+		while (!line.empty() && (line.back() == ' ' || line.back() == '\t')) {
+			line.pop_back();
+		}
+		if (!line.empty()) {
+			break;
+		}
+	}
+	chunk_remaining_ = (int64_t)std::stoul(line, nullptr, 16);
+	if (chunk_remaining_ == 0) {
+		finished_ = true;
+		return false;
+	}
+	return true;
+}
+
+bool HttpSQLBodyStream::ReadRaw(void *dst, size_t n) {
+	auto *out = static_cast<uint8_t *>(dst);
+	while (n > 0) {
+		if (buf_start_ >= buf_end_ && !FillBuf()) {
+			error_ = "connection closed unexpectedly";
+			return false;
+		}
+		size_t avail = std::min(n, buf_end_ - buf_start_);
+		memcpy(out, buf_ + buf_start_, avail);
+		out += avail;
+		buf_start_ += avail;
+		n -= avail;
+	}
+	return true;
+}
+
+bool HttpSQLBodyStream::ReadExact(void *dst, size_t n) {
+	auto *out = static_cast<uint8_t *>(dst);
+	while (n > 0) {
+		if (finished_) {
+			error_ = "read past end of stream";
+			return false;
+		}
+		if (is_chunked_) {
+			if (chunk_remaining_ == 0) {
+				if (!AdvanceChunk()) {
+					return false;
+				}
+			}
+			size_t take = std::min(n, (size_t)chunk_remaining_);
+			if (!ReadRaw(out, take)) {
+				return false;
+			}
+			out += take;
+			n -= take;
+			chunk_remaining_ -= take;
+			if (chunk_remaining_ == 0) {
+				// Consume the trailing \r\n after this chunk's data
+				char crlf[2];
+				ReadRaw(crlf, 2);
+			}
+		} else {
+			// Content-length or read-until-close mode
+			if (content_remaining_ == 0) {
+				finished_ = true;
+				error_ = "read past content-length";
+				return false;
+			}
+			size_t take = n;
+			if (content_remaining_ > 0) {
+				take = std::min(n, (size_t)content_remaining_);
+			}
+			if (!ReadRaw(out, take)) {
+				// Connection closed — treat as end of stream for unknown-length case
+				if (content_remaining_ < 0 && error_.empty()) {
+					finished_ = true;
+					return false;
+				}
+				return false;
+			}
+			out += take;
+			n -= take;
+			if (content_remaining_ > 0) {
+				content_remaining_ -= take;
+				if (content_remaining_ == 0) {
+					finished_ = true;
+				}
+			}
+		}
+	}
+	return true;
+}
+
+// ─── Streaming POST ───────────────────────────────────────────────────────────
+
+// Sends the POST request and reads response headers. On 2xx: returns a
+// streaming body reader. On non-2xx: reads the error body into resp.error.
+HttpStreamingResponse HttpSQLHttpClient::DoStreamingPostOnFd(int fd, const std::string &path,
+                                                              const std::string &body) {
+	HttpStreamingResponse resp;
+
+	// Build and send request (identical to DoRequestOnFd)
+	std::string req;
+	req.reserve(256 + body.size());
+	req += "POST "; req += path; req += " HTTP/1.1\r\n";
+	req += "Host: "; req += host_; req += ':'; req += std::to_string(port_); req += "\r\n";
+	req += "Connection: keep-alive\r\n";
+	if (!body.empty()) {
+		req += "Content-Type: application/json\r\n";
+		req += "Content-Length: "; req += std::to_string(body.size()); req += "\r\n";
+	}
+	req += "\r\n";
+	req += body;
+
+	size_t sent = 0;
+	while (sent < req.size()) {
+		ssize_t n = send(fd, req.c_str() + sent, req.size() - sent, MSG_NOSIGNAL);
+		if (n <= 0) {
+			resp.error = "send() failed";
+			return resp;
+		}
+		sent += n;
+	}
+
+	// Read response status + headers via ConnReader
+	ConnReader reader;
+	reader.fd = fd;
+
+	std::string status_line;
+	if (!reader.ReadLine(status_line)) {
+		resp.error = "recv() failed on status line";
+		return resp;
+	}
+
+	auto sp1 = status_line.find(' ');
+	if (sp1 != std::string::npos) {
+		resp.status_code = std::stoi(status_line.substr(sp1 + 1));
+	}
+
+	bool is_chunked = false;
+	int64_t content_length = -1;
+
+	std::string header_line;
+	while (reader.ReadLine(header_line) && !header_line.empty()) {
+		auto colon = header_line.find(':');
+		if (colon == std::string::npos) {
+			continue;
+		}
+		std::string key = header_line.substr(0, colon);
+		std::string value = header_line.substr(colon + 1);
+		while (!value.empty() && (value.front() == ' ' || value.front() == '\t')) {
+			value.erase(0, 1);
+		}
+		for (auto &c : key) {
+			c = (char)tolower((unsigned char)c);
+		}
+		if (key == "transfer-encoding") {
+			for (auto &c : value) {
+				c = (char)tolower((unsigned char)c);
+			}
+			is_chunked = value.find("chunked") != std::string::npos;
+		} else if (key == "content-length") {
+			content_length = std::stoll(value);
+		}
+	}
+
+	if (resp.status_code >= 200 && resp.status_code < 300) {
+		// Hand off the socket + buffered bytes to the streaming body reader.
+		resp.body.reset(new HttpSQLBodyStream(this, fd,
+		                                      reader.buf, reader.start, reader.end,
+		                                      is_chunked, content_length));
+	} else {
+		// Non-2xx: read full error body for diagnostics, then close the fd.
+		HttpResponse tmp;
+		if (is_chunked) {
+			std::string chunk_size_line;
+			while (reader.ReadLine(chunk_size_line)) {
+				auto semi = chunk_size_line.find(';');
+				if (semi != std::string::npos) {
+					chunk_size_line = chunk_size_line.substr(0, semi);
+				}
+				if (chunk_size_line.empty()) {
+					continue;
+				}
+				size_t chunk_size = std::stoul(chunk_size_line, nullptr, 16);
+				if (chunk_size == 0) {
+					break;
+				}
+				if (!reader.ReadExact(tmp.body, chunk_size)) {
+					break;
+				}
+				reader.ReadLine(chunk_size_line); // consume trailing \r\n
+			}
+		} else if (content_length >= 0) {
+			reader.ReadExact(tmp.body, (size_t)content_length);
+		}
+		resp.error = tmp.body.empty() ? ("HTTP " + std::to_string(resp.status_code)) : tmp.body;
+		CloseConn(fd);
+	}
+	return resp;
+}
+
+HttpStreamingResponse HttpSQLHttpClient::PostStreaming(const std::string &path,
+                                                       const std::string &body) {
+	for (int attempt = 0; attempt < 2; attempt++) {
+		int fd = (attempt == 0) ? AcquireConn() : NewConn();
+		if (fd < 0) {
+			HttpStreamingResponse r;
+			r.error = "failed to connect to " + host_ + ":" + std::to_string(port_);
+			return r;
+		}
+		auto resp = DoStreamingPostOnFd(fd, path, body);
+		if (resp.status_code > 0) {
+			// fd ownership transferred to HttpSQLBodyStream (or already closed on error)
+			return resp;
+		}
+		// status_code == 0 means send/recv failed — connection was stale
+		CloseConn(fd);
+	}
+	HttpStreamingResponse r;
+	r.error = "connection failed after retry";
+	return r;
+}
+
 } // namespace duckdb

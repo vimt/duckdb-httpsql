@@ -261,10 +261,10 @@ unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowS
 	free(json_raw);
 	yyjson_mut_doc_free(jdoc);
 
-	auto resp = cat.http.Post("/api/query", body);
+	auto resp = cat.http.PostStreaming("/api/query", body);
 	if (!resp.ok()) {
 		throw IOException("httpsql: POST /api/query failed (status %d): %s", resp.status_code,
-		                  resp.body.empty() ? resp.error : resp.body);
+		                  resp.error.c_str());
 	}
 
 	return HttpSQLMakeIPCStream(std::move(resp.body));
