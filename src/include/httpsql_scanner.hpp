@@ -42,6 +42,10 @@ struct HttpSQLBindData : public ArrowScanFunctionData {
 	// Used in agg mode so HttpSQLProduce doesn't try to build it from the
 	// (now-invalid) virtual column ArrowStreamParameters.
 	string agg_where_clause;
+	// WHERE captured from parent LogicalFilter (non-group-col filters that
+	// FilterPushdown couldn't push through the aggregate).  Merged into
+	// agg_where_clause by TryHandleAggregate before the column rewrite.
+	string pre_filter_where;
 
 	unique_ptr<FunctionData> Copy() const override {
 		throw NotImplementedException("HttpSQLBindData copy not supported");

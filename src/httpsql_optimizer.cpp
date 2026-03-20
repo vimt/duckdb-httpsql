@@ -14,11 +14,17 @@
 #include "duckdb/planner/expression/bound_cast_expression.hpp"
 #include "duckdb/planner/expression/bound_columnref_expression.hpp"
 #include "duckdb/planner/operator/logical_aggregate.hpp"
+#include "duckdb/planner/operator/logical_filter.hpp"
 #include "duckdb/planner/operator/logical_get.hpp"
 #include "duckdb/planner/operator/logical_limit.hpp"
 #include "duckdb/planner/operator/logical_order.hpp"
 #include "duckdb/planner/operator/logical_projection.hpp"
 #include "duckdb/planner/operator/logical_top_n.hpp"
+
+#include "duckdb/planner/expression/bound_comparison_expression.hpp"
+#include "duckdb/planner/expression/bound_conjunction_expression.hpp"
+#include "duckdb/planner/expression/bound_constant_expression.hpp"
+#include "duckdb/planner/expression/bound_operator_expression.hpp"
 
 namespace duckdb {
 
@@ -147,6 +153,124 @@ static void RemapOperatorBindings(LogicalOperator &op, const column_binding_map_
 	for (auto &expr : op.expressions) RemapExpressionBindings(*expr, remap);
 }
 
+// ─── Expression → SQL (for capturing parent LogicalFilter WHERE) ─────────────
+
+static string ValueToSQL(const Value &val) {
+	if (val.IsNull()) return "NULL";
+	switch (val.type().id()) {
+	case LogicalTypeId::BOOLEAN:
+		return val.GetValue<bool>() ? "1" : "0";
+	case LogicalTypeId::TINYINT: case LogicalTypeId::SMALLINT:
+	case LogicalTypeId::INTEGER: case LogicalTypeId::BIGINT:
+	case LogicalTypeId::UTINYINT: case LogicalTypeId::USMALLINT:
+	case LogicalTypeId::UINTEGER: case LogicalTypeId::UBIGINT:
+	case LogicalTypeId::FLOAT: case LogicalTypeId::DOUBLE:
+		return val.ToString();
+	default:
+		return "'" + StringUtil::Replace(val.ToString(), "'", "\\'") + "'";
+	}
+}
+
+static string ComparisonOpToSQL(ExpressionType type) {
+	switch (type) {
+	case ExpressionType::COMPARE_EQUAL:                return "=";
+	case ExpressionType::COMPARE_NOTEQUAL:             return "!=";
+	case ExpressionType::COMPARE_LESSTHAN:             return "<";
+	case ExpressionType::COMPARE_GREATERTHAN:          return ">";
+	case ExpressionType::COMPARE_LESSTHANOREQUALTO:    return "<=";
+	case ExpressionType::COMPARE_GREATERTHANOREQUALTO: return ">=";
+	default: return "";
+	}
+}
+
+// Forward declaration.
+static string ExprToSQL(const Expression &expr, const LogicalGet &get);
+
+static string ExprToSQL(const Expression &expr, const LogicalGet &get) {
+	switch (expr.GetExpressionClass()) {
+	case ExpressionClass::BOUND_COLUMN_REF: {
+		auto &col_ref = expr.Cast<BoundColumnRefExpression>();
+		if (col_ref.binding.table_index != get.table_index) return "";
+		auto &col_ids = get.GetColumnIds();
+		if (col_ref.binding.column_index >= col_ids.size()) return "";
+		auto &ci = col_ids[col_ref.binding.column_index];
+		if (ci.IsRowIdColumn() || ci.GetPrimaryIndex() >= get.names.size()) return "";
+		return WriteIdentifier(get.names[ci.GetPrimaryIndex()]);
+	}
+	case ExpressionClass::BOUND_CONSTANT:
+		return ValueToSQL(expr.Cast<BoundConstantExpression>().value);
+	case ExpressionClass::BOUND_COMPARISON: {
+		auto &cmp = expr.Cast<BoundComparisonExpression>();
+		string op = ComparisonOpToSQL(cmp.GetExpressionType());
+		if (op.empty()) return "";
+		string left  = ExprToSQL(*cmp.left, get);
+		string right = ExprToSQL(*cmp.right, get);
+		if (left.empty() || right.empty()) return "";
+		return left + " " + op + " " + right;
+	}
+	case ExpressionClass::BOUND_CONJUNCTION: {
+		auto &conj = expr.Cast<BoundConjunctionExpression>();
+		string op = (conj.GetExpressionType() == ExpressionType::CONJUNCTION_AND) ? " AND " : " OR ";
+		vector<string> parts;
+		for (auto &child : conj.children) {
+			string s = ExprToSQL(*child, get);
+			if (s.empty()) return ""; // bail if any sub-expression can't be translated
+			parts.push_back(s);
+		}
+		if (parts.empty()) return "";
+		return "(" + StringUtil::Join(parts, op) + ")";
+	}
+	case ExpressionClass::BOUND_OPERATOR: {
+		auto &op_expr = expr.Cast<BoundOperatorExpression>();
+		if (op_expr.children.size() == 1) {
+			string col = ExprToSQL(*op_expr.children[0], get);
+			if (col.empty()) return "";
+			if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NULL)     return col + " IS NULL";
+			if (op_expr.GetExpressionType() == ExpressionType::OPERATOR_IS_NOT_NULL) return col + " IS NOT NULL";
+		}
+		return "";
+	}
+	case ExpressionClass::BOUND_CAST:
+		// Pass through implicit casts (e.g. int literal cast to bigint).
+		return ExprToSQL(*expr.Cast<BoundCastExpression>().child, get);
+	default:
+		return "";
+	}
+}
+
+// Top-down pre-pass: when we see LogicalFilter → LogicalAggregate → LogicalGet(httpsql),
+// capture the filter expressions as SQL before children are processed and the agg
+// column rewrite invalidates the column bindings.
+static void CaptureParentFilterWhereForAgg(LogicalOperator &op) {
+	if (op.type != LogicalOperatorType::LOGICAL_FILTER) return;
+	if (op.children.empty()) return;
+
+	LogicalOperator &agg_candidate = SkipProjections(*op.children[0]);
+	if (agg_candidate.type != LogicalOperatorType::LOGICAL_AGGREGATE_AND_GROUP_BY) return;
+
+	auto &agg = agg_candidate.Cast<LogicalAggregate>();
+	if (agg.children.empty()) return;
+
+	LogicalOperator &get_candidate = SkipProjections(*agg.children[0]);
+	if (get_candidate.type != LogicalOperatorType::LOGICAL_GET) return;
+
+	auto &get = get_candidate.Cast<LogicalGet>();
+	if (!IsHttpSQLScan(get)) return;
+
+	auto &bind_data = get.bind_data->Cast<HttpSQLBindData>();
+	if (bind_data.pre_filter_where.empty()) {
+		// Translate each filter expression; skip any we can't handle.
+		vector<string> parts;
+		for (auto &expr : op.expressions) {
+			string s = ExprToSQL(*expr, get);
+			if (!s.empty()) parts.push_back(s);
+		}
+		if (!parts.empty()) {
+			bind_data.pre_filter_where = StringUtil::Join(parts, " AND ");
+		}
+	}
+}
+
 // ─── Aggregate pushdown ──────────────────────────────────────────────────────
 
 enum class AggKind { COUNT_STAR, COUNT_COL, SUM, MIN, MAX };
@@ -272,13 +396,27 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 		pushdown->output_cols.push_back({info.sql_expr});
 	}
 
-	// ── Bug fix: save WHERE clause before the column rewrite ────────────────
+	// ── Save WHERE from table_filters (group-col filters pushed down to Get) ──
 	// After SetColumnIds/names the old filter_to_col mapping is invalid; save
 	// the SQL WHERE string now so HttpSQLProduce can use it in agg mode.
 	if (!get.table_filters.filters.empty()) {
 		bind_data.agg_where_clause =
 		    HttpSQLBuildWhereFromTableFilters(get.table_filters, bind_data.all_names);
 		get.table_filters.filters.clear();
+	}
+
+	// ── Merge pre_filter_where (non-group-col filters from parent LogicalFilter) ──
+	// FilterPushdown cannot push non-group-column filters through an aggregate;
+	// they stay as a LogicalFilter above the aggregate.  CaptureParentFilterWhereForAgg
+	// ran top-down and captured those as SQL before the column rewrite below.
+	if (!bind_data.pre_filter_where.empty()) {
+		if (bind_data.agg_where_clause.empty()) {
+			bind_data.agg_where_clause = bind_data.pre_filter_where;
+		} else {
+			bind_data.agg_where_clause =
+			    "(" + bind_data.agg_where_clause + ") AND (" + bind_data.pre_filter_where + ")";
+		}
+		bind_data.pre_filter_where.clear();
 	}
 
 	vector<ColumnIndex> new_col_ids;
@@ -394,6 +532,11 @@ static column_binding_map_t<ColumnBinding> TryHandleAggregate(OptimizerExtension
 
 static column_binding_map_t<ColumnBinding> OptimizePlan(OptimizerExtensionInput &input,
                                                         unique_ptr<LogicalOperator> &op) {
+	// Top-down: capture parent LogicalFilter WHERE before children are processed,
+	// so the column bindings are still valid (the bottom-up agg rewrite below
+	// will later replace them with virtual _g0/_a0 names).
+	CaptureParentFilterWhereForAgg(*op);
+
 	column_binding_map_t<ColumnBinding> all_remaps;
 	for (auto &child : op->children) {
 		auto child_remaps = OptimizePlan(input, child);
