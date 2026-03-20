@@ -215,7 +215,10 @@ struct HttpSQLIPCState {
 		while (true) {
 			if (!NextMessage()) {
 				out->release = nullptr;
-				return NANOARROW_OK; // EOS
+				// If last_error is set, the stream was truncated unexpectedly;
+				// propagate as an error so DuckDB surfaces it to the user.
+				// If last_error is empty, this is a normal Arrow IPC EOS marker.
+				return last_error.empty() ? NANOARROW_OK : EIO;
 			}
 			if (decoder.message_type == NANOARROW_IPC_MESSAGE_TYPE_RECORD_BATCH) {
 				break;
