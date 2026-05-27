@@ -1,0 +1,68 @@
+#
+# Daily check for new DuckDB releases. If upstream has a newer stable tag and
+# extension-ci-tools has a matching branch, bump submodules + workflow refs,
+# commit, push, and explicitly dispatch the build pipeline (pushes from
+# GITHUB_TOKEN do not trigger workflows on their own).
+#
+name: Auto-bump DuckDB version
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  check-and-bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Find latest stable DuckDB tag
+        id: latest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          LATEST=$(gh release list --repo duckdb/duckdb --limit 30 \
+                     --json tagName,isPrerelease,isDraft \
+                   | jq -r '[.[] | select(.isPrerelease==false and .isDraft==false)] | .[0].tagName')
+          echo "tag=$LATEST" >> "$GITHUB_OUTPUT"
+          echo "Latest stable DuckDB tag: $LATEST"
+
+      - name: Find current pinned tag
+        id: current
+        run: |
+          CURRENT=$(git -C duckdb describe --exact-match --tags HEAD 2>/dev/null || echo "unknown")
+          echo "tag=$CURRENT" >> "$GITHUB_OUTPUT"
+          echo "Currently pinned: $CURRENT"
+
+      - name: Verify extension-ci-tools branch exists for new version
+        id: verify
+        if: steps.latest.outputs.tag != steps.current.outputs.tag
+        run: |
+          TAG="${{ steps.latest.outputs.tag }}"
+          if git ls-remote --exit-code --heads \
+              https://github.com/duckdb/extension-ci-tools.git "$TAG" > /dev/null; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "extension-ci-tools has no branch $TAG yet, skipping bump."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump, commit, push, dispatch build
+        if: steps.latest.outputs.tag != steps.current.outputs.tag && steps.verify.outputs.ok == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          bash scripts/bump-duckdb-version.sh "${{ steps.latest.outputs.tag }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: auto-bump DuckDB to ${{ steps.latest.outputs.tag }}"
+          git push origin main
+          gh workflow run MainDistributionPipeline.yml --ref main
