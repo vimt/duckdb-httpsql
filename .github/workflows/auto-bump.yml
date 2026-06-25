@@ -1,8 +1,11 @@
 #
 # Daily check for new DuckDB releases. If upstream has a newer stable tag and
 # extension-ci-tools has a matching branch, bump submodules + workflow refs,
-# commit, push, and explicitly dispatch the build pipeline (pushes from
-# GITHUB_TOKEN do not trigger workflows on their own).
+# commit and push. The push uses WORKFLOW_PAT (a Personal Access Token) so
+# that (a) the .github/workflows/ file can be updated — the default
+# GITHUB_TOKEN is forbidden from modifying workflow files — and (b) the push
+# is attributed to a real user and triggers MainDistributionPipeline.yml
+# automatically (pushes by GITHUB_TOKEN are suppressed to prevent loops).
 #
 name: Auto-bump DuckDB version
 on:
@@ -11,8 +14,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 jobs:
   check-and-bump:
@@ -22,6 +24,7 @@ jobs:
         with:
           submodules: recursive
           fetch-depth: 0
+          token: ${{ secrets.WORKFLOW_PAT }}
 
       - name: Find latest stable DuckDB tag
         id: latest
@@ -54,10 +57,8 @@ jobs:
             echo "ok=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Bump, commit, push, dispatch build
+      - name: Bump, commit, push
         if: steps.latest.outputs.tag != steps.current.outputs.tag && steps.verify.outputs.ok == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
         run: |
           bash scripts/bump-duckdb-version.sh "${{ steps.latest.outputs.tag }}"
           git config user.name "github-actions[bot]"
@@ -65,4 +66,3 @@ jobs:
           git add -A
           git commit -m "chore: auto-bump DuckDB to ${{ steps.latest.outputs.tag }}"
           git push origin main
-          gh workflow run MainDistributionPipeline.yml --ref main
