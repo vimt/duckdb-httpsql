@@ -9,9 +9,11 @@
 #
 name: Auto-bump DuckDB version
 on:
-  schedule:
-    - cron: '0 6 * * *'
   workflow_dispatch:
+  # schedule disabled until DuckDB v2.0 stable + matching extension-ci-tools branch exist.
+  # Re-enable by uncommenting the cron line below once v2.0.0 is the latest stable tag.
+  # schedule:
+  #   - cron: '0 6 * * *'
 
 permissions:
   contents: read
