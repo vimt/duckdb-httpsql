@@ -50,7 +50,7 @@ void HttpSQLCatalog::EnsureSchemasLoaded() {
 	for (auto &name : ParseStringArray(resp.body)) {
 		if (schema_entries_.find(name) == schema_entries_.end()) {
 			CreateSchemaInfo info;
-			info.schema = name;
+			info.SetSchema(Identifier(name));
 			schema_entries_[name] = make_uniq<HttpSQLSchemaEntry>(*this, info, schema_ttl_sec_);
 		}
 	}

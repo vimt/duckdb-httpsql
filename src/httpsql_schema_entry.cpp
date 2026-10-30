@@ -54,6 +54,7 @@ static LogicalType DuckDBTypeToLogical(const string &type) {
 struct TableParseResult {
 	string name;
 	vector<ColumnInfo> columns;
+	int64_t row_estimate = 0;
 };
 
 static vector<TableParseResult> ParseTablesJSON(const string &json) {
@@ -90,6 +91,9 @@ static vector<TableParseResult> ParseTablesJSON(const string &json) {
 			}
 		}
 
+		auto *row_est = yyjson_obj_get(tobj, "row_estimate");
+		if (row_est && yyjson_is_int(row_est)) tbl.row_estimate = yyjson_get_int(row_est);
+
 		result.push_back(std::move(tbl));
 	}
 	yyjson_doc_free(doc);
@@ -121,9 +125,9 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 	for (auto &tbl : ParseTablesJSON(resp.body)) {
 		if (tbl.columns.empty()) continue;
 
-		auto create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)*this, tbl.name);
+		auto create_info = make_uniq<CreateTableInfo>((SchemaCatalogEntry &)*this, Identifier(tbl.name));
 		for (auto &col : tbl.columns) {
-			ColumnDefinition column(col.name, DuckDBTypeToLogical(col.duckdb_type));
+			ColumnDefinition column(Identifier(col.name), DuckDBTypeToLogical(col.duckdb_type));
 			if (!col.is_nullable) {
 				auto col_idx = create_info->columns.LogicalColumnCount();
 				create_info->constraints.push_back(make_uniq<NotNullConstraint>(LogicalIndex(col_idx)));
@@ -132,6 +136,7 @@ void HttpSQLSchemaEntry::EnsureTablesLoaded(ClientContext &context) {
 		}
 		if (create_info->columns.LogicalColumnCount() > 0) {
 			auto entry = make_uniq<HttpSQLTableEntry>(catalog, *this, *create_info);
+			entry->SetRowEstimate(static_cast<idx_t>(tbl.row_estimate));
 			tables_[tbl.name] = std::move(entry);
 		}
 	}

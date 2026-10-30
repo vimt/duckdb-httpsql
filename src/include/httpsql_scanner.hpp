@@ -16,17 +16,21 @@ struct AggPushdown {
 	vector<string> group_col_names;
 };
 
-// stream_factory_produce_t callback – defined in httpsql_scanner.cpp
-unique_ptr<ArrowArrayStreamWrapper> HttpSQLProduce(uintptr_t factory_ptr, ArrowStreamParameters &parameters);
+struct HttpSQLBindData;
 
-// Build a SQL WHERE clause from a LogicalGet's table_filters before they are
-// invalidated by the agg-pushdown column rewrite.
-// The keys in table_filters.filters are physical column indices, so names must
-// be the original full column list (bind_data.all_names).
-string HttpSQLBuildWhereFromTableFilters(const TableFilterSet &filters, const vector<string> &names);
+// ArrowScanFactory implementation: bridges DuckDB v2.0's Arrow scan framework
+// (which calls factory->ProduceStream during execution) to httpsql's HTTP-based
+// stream producer.  Holds a raw back-pointer to the bind_data that owns the
+// factory (via ArrowScanFunctionData::factory); the bind_data outlives the factory.
+struct HttpSQLArrowScanFactory : public ArrowScanFactory {
+	HttpSQLBindData *bind_data = nullptr;
+
+	void GetSchema(ArrowSchema &schema) override;
+	unique_ptr<ArrowArrayStreamWrapper> ProduceStream(ArrowStreamParameters &parameters) override;
+};
 
 struct HttpSQLBindData : public ArrowScanFunctionData {
-	explicit HttpSQLBindData(HttpSQLTableEntry &table);
+	explicit HttpSQLBindData(HttpSQLTableEntry &table_p);
 
 	// Keep a reference to the table entry (lifetime managed by catalog).
 	HttpSQLTableEntry &table;
@@ -34,18 +38,16 @@ struct HttpSQLBindData : public ArrowScanFunctionData {
 	// All column names in physical schema order; used to map filter col IDs → names.
 	vector<string> all_names;
 
-	// ── Pushdown state (written by optimizer, read by HttpSQLProduce) ──────
+	// ── Pushdown state (written by optimizer, read by ProduceStream) ──────
 	string limit_clause;
 	string order_clause;
 	unique_ptr<AggPushdown> agg_pushdown;
 	// WHERE clause pre-computed by the optimizer before agg column rewrite.
-	// Used in agg mode so HttpSQLProduce doesn't try to build it from the
-	// (now-invalid) virtual column ArrowStreamParameters.
 	string agg_where_clause;
-	// WHERE captured from parent LogicalFilter (non-group-col filters that
-	// FilterPushdown couldn't push through the aggregate).  Merged into
-	// agg_where_clause by TryHandleAggregate before the column rewrite.
+	// WHERE captured from parent LogicalFilter
 	string pre_filter_where;
+	// HAVING clause captured from parent LogicalFilter after agg rewrite.
+	string having_clause;
 
 	unique_ptr<FunctionData> Copy() const override {
 		throw NotImplementedException("HttpSQLBindData copy not supported");
@@ -54,6 +56,11 @@ struct HttpSQLBindData : public ArrowScanFunctionData {
 		return false;
 	}
 };
+
+// Build a SQL WHERE clause from a LogicalGet's table_filters before they are
+// invalidated by the agg-pushdown column rewrite.
+string HttpSQLBuildWhereFromTableFilters(const TableFilterSet &filters, const vector<ColumnIndex> &column_ids,
+                                          const vector<string> &names);
 
 TableFunction CreateHttpSQLScanFunction();
 

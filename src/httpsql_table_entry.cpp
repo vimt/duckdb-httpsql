@@ -8,7 +8,7 @@
 namespace duckdb {
 
 HttpSQLTableEntry::HttpSQLTableEntry(Catalog &catalog, SchemaCatalogEntry &schema, CreateTableInfo &info)
-    : TableCatalogEntry(catalog, schema, info) {
+    : TableCatalogEntry(catalog, schema, info), column_list_(info.columns.Copy()) {
 }
 
 unique_ptr<BaseStatistics> HttpSQLTableEntry::GetStatistics(ClientContext &, column_t) {
@@ -25,9 +25,9 @@ TableFunction HttpSQLTableEntry::GetScanFunction(ClientContext &context, unique_
 	// Collect column types and names from the catalog entry.
 	vector<LogicalType> types;
 	vector<string> names;
-	for (auto &col : columns.Logical()) {
+	for (auto &col : GetColumns().Logical()) {
 		types.push_back(col.GetType());
-		names.push_back(col.GetName());
+		names.push_back(col.GetName().GetIdentifierName());
 	}
 	result->all_names = names;
 	result->all_types = types; // used by ArrowScanFunctionData
@@ -47,7 +47,7 @@ TableFunction HttpSQLTableEntry::GetScanFunction(ClientContext &context, unique_
 
 TableStorageInfo HttpSQLTableEntry::GetStorageInfo(ClientContext &) {
 	TableStorageInfo result;
-	result.cardinality = 0;
+	result.cardinality = row_estimate_;
 	return result;
 }
 

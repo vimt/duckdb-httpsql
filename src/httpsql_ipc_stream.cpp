@@ -264,7 +264,7 @@ unique_ptr<ArrowArrayStreamWrapper> HttpSQLMakeIPCStream(std::unique_ptr<HttpSQL
 	s.get_last_error = IPCGetLastError;
 	s.release = IPCRelease;
 	s.private_data = new HttpSQLIPCState(std::move(stream));
-	result->number_of_rows = -1; // unknown row count
+	// number_of_rows removed in v2.0 — row count is unknown at stream creation time
 	return result;
 }
 
